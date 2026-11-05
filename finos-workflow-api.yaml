@@ -1,0 +1,2496 @@
+openapi: 3.0.3
+
+# =============================================================================
+# FinOSWorkflow API — REST API Specification
+# Version:    1.0.0
+# Platform:   Blackline FinOS Orchestration Platform
+# Base URL:   https://api.example.com/finos/v1
+#
+# Covers:
+#   1. FinOSWorkflow definition CRUD (create, read, update, delete, run)
+#   2. Node CRUD — insert / append / update / remove
+#      (FinOSStart, FinOSAgent, FinOSAPI, FinOSAsyncAPI, FinOSHITL, FinOSPolicy,
+#       FinOSWorkflow, FinOSTerminal, FinOSFanOut)
+#   3. Edge CRUD — add / update condition / remove
+#   4. DAG graph queries
+# =============================================================================
+
+info:
+  title: FinOSWorkflow API
+  description: |
+    REST API for managing **FinOSWorkflow** definitions on the
+    Blackline FinOS Orchestration Platform.
+
+    A FinOSWorkflow is a **Directed Acyclic Graph (DAG)** of typed nodes and
+    directed condition edges. Workflows are registered with, and executed by,
+    the **FinOS Workflows Engine**. The definition carries no runtime-vendor
+    concepts; execution concerns (durability, retries, signals) are invisible
+    to workflow authors.
+
+    ---
+
+    ## Node Types
+
+    | Type | Invocation | Engine obligation |
+    |---|---|---|
+    | `FinOSStart` | Explicit DAG entry point — exactly one per workflow | Evaluate outgoing edges; no side effect |
+    | `FinOSAgent` | A2A protocol — FinOS Agent Runtime | Send an A2A message, await the Task, apply `outputMapping` |
+    | `FinOSAPI` | External REST API call | Issue the request, apply `responseMapping`, honour `retryPolicy` |
+    | `FinOSAsyncAPI` | Long-running callback/event — kicks off a job then suspends | Fire the kickoff, suspend against a resume token, resume on callback or event |
+    | `FinOSHITL` | Human-in-the-loop — suspends execution | Create a reviewer callback, suspend, resume on a valid decision |
+    | `FinOSPolicy` | Policy evaluation | Call `POST /policies/{policyDefinitionId}/evaluate`, bind `policy_outcome` |
+    | `FinOSWorkflow` | Durable child-workflow invocation | child execution resolved via the Workflow Registry |
+    | `FinOSFanOut` | Parallel child-workflow fan-out over a collection | one child execution per item |
+    | `FinOSTerminal` | Explicit typed terminal — at least one per workflow | none (exit semantics only) |
+
+    ## Node Authentication
+
+    A node that makes an outbound call declares how to authenticate it in its
+    own `auth` block (`AuthConfig`). Credentials shared by more than one node
+    may be hoisted into the workflow-level `authentication` block
+    (`AuthenticationSchemes`) and referenced by `schemeRef`. Secret values
+    never appear in a workflow definition — credential fields carry opaque,
+    platform-recognized references. `auth` is honoured on `FinOSAgent`,
+    `FinOSAPI`, and `FinOSAsyncAPI` nodes only. See §2.2 of
+    `0-finos-workflow-guide.md`.
+
+    ## Edge Condition Syntax
+
+    All edge conditions use **FinOS Workflows expression syntax** wrapped in `${ }`:
+
+    ```
+    "${ .policy_outcome == \"Escalate\" }"
+    "${ .invoice_amount >= 50000 and .manager_decision == \"APPROVED\" }"
+    null   →  unconditional (always traversed)
+    ```
+
+    ## Response Envelope
+
+    All responses use a consistent envelope:
+    ```json
+    { "data": { ... }, "meta": { "requestId": "...", "timestamp": "...", "apiVersion": "1.0" } }
+    ```
+
+    ## Error Format
+
+    Errors follow RFC 7807 Problem Details (`application/problem+json`).
+
+    ## Namespace Placeholders
+
+    Examples in this document use `{vendor-domain}`, `{event-namespace}`,
+    `{source-root}` and `{api-host}` where a wire identifier must live in a
+    namespace the implementation controls. Substitute all four consistently at
+    deployment time; the structure after the namespace root is normative. See
+    README §3.4.
+  version: 1.0.0
+  contact:
+    name: Blackline FinOS Platform Team
+    email: finos-platform@blackline.com
+    url: https://developer.blackline.com/finos
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+servers:
+  - url: https://api.example.com/finos/v1
+    description: Production
+  - url: https://api-sandbox.example.com/finos/v1
+    description: Sandbox / Development
+
+security:
+  - bearerAuth: []
+  - apiKeyAuth: []
+
+tags:
+  - name: FinOSWorkflow
+    description: Workflow definition lifecycle — create, read, update, delete
+  - name: Nodes
+    description: |
+      DAG node CRUD — insert, append after existing node, update config, remove.
+      All nine node types (FinOSStart, FinOSAgent, FinOSAPI, FinOSAsyncAPI, FinOSHITL, FinOSPolicy, FinOSTerminal, FinOSFanOut, FinOSWorkflow) share
+      these endpoints and are discriminated by the `nodeType` field.
+  - name: Edges
+    description: |
+      DAG edge CRUD — add directed edges, update condition expressions, remove edges.
+      Edge conditions follow FinOS Workflows expression syntax.
+  - name: Graph
+    description: DAG-level queries — full graph, path finding
+  - name: Deployment
+    description: Validate, export as FinOS Workflows YAML, and trigger runs
+
+# =============================================================================
+# PATHS
+# =============================================================================
+paths:
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 1. FinOSWorkflow CRUD
+  # ───────────────────────────────────────────────────────────────────────────
+
+  /workflows:
+    get:
+      operationId: listFinOSWorkflows
+      summary: List workflow definitions
+      tags: [FinOSWorkflow]
+      parameters:
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/WorkflowStatus' }
+        - $ref: '#/components/parameters/filter'
+        - $ref: '#/components/parameters/sort'
+        - $ref: '#/components/parameters/sortOrder'
+        - $ref: '#/components/parameters/pageSize'
+        - $ref: '#/components/parameters/pageStartIndex'
+      responses:
+        "200":
+          description: Paginated list of workflow definitions
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FinOSWorkflowListResponse' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+
+    post:
+      operationId: createFinOSWorkflow
+      summary: Create a new workflow definition
+      description: |
+        Creates a FinOSWorkflow in `DRAFT` status. Nodes and edges may be
+        included inline or added later via the `/nodes` and `/edges`
+        sub-resources. Transition to `ACTIVE` after validation.
+      tags: [FinOSWorkflow]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FinOSWorkflowCreate' }
+            example:
+              workflowId: "wf-invoice-approval-v1"
+              workflowName: "Invoice Approval Workflow"
+              workflowVersion: "1.0.0"
+              description: "Multi-tier invoice approval with spending-limit policy and HITL review tiers."
+              tenantId: "tenant-acme-prod"
+      responses:
+        "201":
+          description: Workflow created
+          headers:
+            Location:
+              schema: { type: string }
+              example: "https://{api-host}/finos/v1/workflows/wf-invoice-approval-v1"
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FinOSWorkflowResponse' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "409": { $ref: '#/components/responses/Conflict' }
+        "422": { $ref: '#/components/responses/ValidationError' }
+
+  /workflows/{workflowId}:
+    parameters:
+      - $ref: '#/components/parameters/workflowId'
+
+    get:
+      operationId: getFinOSWorkflow
+      summary: Retrieve a workflow definition
+      tags: [FinOSWorkflow]
+      parameters:
+        - name: embed
+          in: query
+          description: Controls payload depth
+          schema:
+            type: string
+            enum: [none, nodes, edges, full]
+            default: full
+      responses:
+        "200":
+          description: Workflow definition
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FinOSWorkflowResponse' }
+        "404": { $ref: '#/components/responses/NotFound' }
+
+    put:
+      operationId: replaceFinOSWorkflow
+      summary: Full replacement of a workflow definition
+      description: |
+        Replaces all fields, nodes, and edges. The workflow must be in `DRAFT`
+        status (set via `PATCH /status` first if it is `ACTIVE`).
+      tags: [FinOSWorkflow]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FinOSWorkflowCreate' }
+      responses:
+        "200":
+          description: Workflow replaced
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FinOSWorkflowResponse' }
+        "409": { $ref: '#/components/responses/Conflict' }
+        "422": { $ref: '#/components/responses/ValidationError' }
+
+    patch:
+      operationId: updateFinOSWorkflow
+      summary: Partial update (JSON Merge Patch)
+      description: |
+        Updates scalar fields only. Use `/nodes` and `/edges` sub-resources
+        to modify the DAG structure.
+        **Immutable:** `workflowId`, `tenantId`, `createdAt`.
+      tags: [FinOSWorkflow]
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema: { $ref: '#/components/schemas/FinOSWorkflowPatch' }
+            example:
+              workflowVersion: "1.1.0"
+              description: "Updated to support three-tier CFO approval chain."
+      responses:
+        "200":
+          description: Workflow updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FinOSWorkflowResponse' }
+
+    delete:
+      operationId: deleteFinOSWorkflow
+      summary: Hard-delete a workflow definition
+      description: |
+        Permanently deletes the workflow and all its nodes and edges.
+        Only permitted when `status` is `DRAFT` or `ARCHIVED`.
+        To soft-delete, PATCH `status` → `ARCHIVED`.
+      tags: [FinOSWorkflow]
+      responses:
+        "204": { description: Deleted }
+        "409": { $ref: '#/components/responses/Conflict' }
+        "404": { $ref: '#/components/responses/NotFound' }
+
+  /workflows/{workflowId}/status:
+    patch:
+      operationId: transitionWorkflowStatus
+      summary: Transition workflow lifecycle status
+      description: |
+        **Valid transitions:**
+
+        | From | To | Precondition |
+        |---|---|---|
+        | `DRAFT` | `ACTIVE` | Must pass `/validate` |
+        | `ACTIVE` | `DRAFT` | Unlocks node/edge edits |
+        | `ACTIVE` | `DEPRECATED` | — |
+        | Any | `ARCHIVED` | Soft-delete; data retained |
+      tags: [FinOSWorkflow]
+      parameters:
+        - $ref: '#/components/parameters/workflowId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { $ref: '#/components/schemas/WorkflowStatus' }
+                reason: { type: string }
+            example:
+              status: "ACTIVE"
+              reason: "Validated and approved for production deployment."
+      responses:
+        "200":
+          description: Status transitioned
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FinOSWorkflowResponse' }
+        "409": { $ref: '#/components/responses/Conflict' }
+
+  /workflows/{workflowId}/validate:
+    post:
+      operationId: validateWorkflow
+      summary: Validate DAG integrity and FinOS Workflows compatibility
+      description: |
+        Runs the following checks and returns a `ValidationResult`:
+
+        - DAG is acyclic (DFS cycle detection)
+        - All edge endpoints reference a node defined in the `nodes` list;
+          `FinOSTerminal` nodes must have no outgoing edges
+        - All edge conditions are syntactically valid jq expressions
+        - `FinOSAgent` nodes: `agentId` present
+        - `FinOSPolicy` nodes: `policyDefinitionId` (or legacy `policyId`) present; if
+          `possibleOutcomes` is provided it must be non-empty and every value must appear in
+          at least one outgoing edge condition
+        - Every `auth` block resolves: an `oauth2cc`/`oauth2RO` credential declares an
+          effective `grantType`, an `apiKey` credential declares `header` + `value`, and
+          every `schemeRef` names a scheme present in the workflow-level `authentication` block
+        - `FinOSHITL` nodes: `assignedRole`, `timeoutSeconds` present
+        - `FinOSAPI` nodes: `endpoint`, `httpMethod` present
+        - Graph is connected (no orphaned nodes)
+        - At least one `FinOSTerminal` node exists
+        - Exactly one `FinOSStart` node exists, with zero incoming edges
+      tags: [Deployment]
+      parameters:
+        - $ref: '#/components/parameters/workflowId'
+      responses:
+        "200":
+          description: Validation completed (see `valid` field for pass/fail)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ValidationResult' }
+
+  /workflows/{workflowId}/export:
+    get:
+      operationId: exportWorkflow
+      summary: Export as FinOS Workflows YAML
+      description: |
+        Generates the executable FinOS Workflows YAML from the FinOSWorkflow DAG.
+
+        **Node type → FinOS Workflows translation:**
+
+        | FinOS Node Type | Generated Construct |
+        |---|---|
+        | `FinOSAgent` | A2A message send with governance metadata, under the node's `retryPolicy` |
+        | `FinOSAPI` | HTTP request with the node's method, headers and body, under its `retryPolicy` |
+        | `FinOSHITL` | Reviewer callback creation plus suspension until a decision or `timeoutSeconds` |
+        | `FinOSPolicy` | `POST /policies/{policyDefinitionId}/evaluate`, binding `policy_outcome` |
+
+        **Edge conditions → switch statements:**
+        Outgoing edges from each node, ordered by `priority`, become `switch` steps
+        in the generated YAML. Unconditional edges (`condition: null`) always appear last.
+      tags: [Deployment]
+      parameters:
+        - $ref: '#/components/parameters/workflowId'
+        - name: format
+          in: query
+          schema:
+            type: string
+            enum: [finos-workflows-yaml, finos-yaml, json]
+            default: finos-workflows-yaml
+      responses:
+        "200":
+          description: Exported workflow definition
+          content:
+            text/yaml:
+              schema: { type: string }
+            application/json:
+              schema: { type: object }
+        "404": { $ref: '#/components/responses/NotFound' }
+
+  /workflows/{workflowId}/runs:
+    post:
+      operationId: runWorkflow
+      summary: Trigger a workflow execution
+      description: |
+        Starts a new workflow execution. A conforming implementation loads
+        tenant configuration, merges with run_input, validates required
+        inputs are present, then starts execution. No runtime-vendor
+        concepts appear in this API.
+      tags: [Deployment]
+      parameters:
+        - $ref: '#/components/parameters/workflowId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WorkflowRunRequest'
+      responses:
+        '202':
+          description: Execution started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkflowRunResult'
+        "409": { $ref: '#/components/responses/Conflict' }
+        "422": { $ref: '#/components/responses/ValidationError' }
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 2. Node CRUD
+  # ───────────────────────────────────────────────────────────────────────────
+
+  /workflows/{workflowId}/nodes:
+    parameters:
+      - $ref: '#/components/parameters/workflowId'
+
+    get:
+      operationId: listNodes
+      summary: List all DAG nodes
+      tags: [Nodes]
+      parameters:
+        - name: nodeType
+          in: query
+          schema: { type: string }
+        - $ref: '#/components/parameters/pageSize'
+        - $ref: '#/components/parameters/pageStartIndex'
+      responses:
+        "200":
+          description: List of nodes
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeListResponse' }
+
+    post:
+      operationId: insertNode
+      summary: Insert a new node into the DAG
+      description: |
+        Inserts a new node. By default the node is added without edges. Use
+        `insertAfterNodeId` or `insertBeforeNodeId` to automatically create a
+        unconditional edge as part of the operation.
+
+        **Required fields per node type:**
+
+        | Node Type | Required Config |
+        |---|---|
+        | `FinOSAgent` | `agentId` |
+        | `FinOSAPI` | `endpoint`, `httpMethod` |
+        | `FinOSHITL` | `assignedRole`, `timeoutSeconds` |
+        | `FinOSPolicy` | `policyDefinitionId` (legacy: `policyId`) |
+        | `FinOSAsyncAPI` | `endpoint`, `httpMethod`, `callbackMode`, `resumeTokenInjection`, `timeoutSeconds` |
+        | `FinOSWorkflow` | `workflowId`, `taskInputTemplate` |
+        | `FinOSFanOut` | `workflowId`, `iterateOver`, `iterationVar` |
+        | `FinOSTerminal` | `exitStatus` |
+        | `FinOSStart` | — (no node-specific fields) |
+
+        DAG integrity (acyclicity) is re-validated after every insert.
+      tags: [Nodes]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NodeInsert' }
+            examples:
+              agent_node:
+                summary: Insert a FinOSAgent node
+                value:
+                  nodeId: "node-classify-invoice"
+                  nodeType: "FinOSAgent"
+                  name: "InvoiceClassifierAgent"
+                  description: "Classifies invoice and extracts structured fields using LLM."
+                  agentId: "agt-invoice-classifier-001"
+                  taskInputTemplate:
+                    invoiceId: "${ .invoice_id }"
+                    instruction: "Classify the invoice and extract category, vendorId, totalAmount, currency."
+                  retryPolicy:
+                    maxRetries: 3
+                    initialDelaySeconds: 2
+                    maxDelaySeconds: 30
+                    multiplier: 2
+              api_node:
+                summary: Insert a FinOSAPI node
+                value:
+                  nodeId: "node-fetch-vendor"
+                  nodeType: "FinOSAPI"
+                  name: "VendorDataAPI"
+                  endpoint: "https://erp-api.example.com/v1/vendors/${ .vendor_id }"
+                  httpMethod: "GET"
+                  requestHeaders:
+                    X-Tenant-Id: "${ .tenant_id }"
+                  queryParams:
+                    includeContractTerms: "true"
+                    includeRiskProfile: "true"
+                  responseMapping:
+                    vendor_tier: "${ .body.tier }"
+                    vendor_risk_score: "${ .body.riskScore }"
+                    vendor_approved_spend_limit: "${ .body.approvedSpendLimit }"
+                  retryPolicy:
+                    maxRetries: 3
+                    initialDelaySeconds: 1
+                    maxDelaySeconds: 15
+                    multiplier: 2
+              hitl_node:
+                summary: Insert a FinOSHITL node
+                value:
+                  nodeId: "node-hitl-manager"
+                  nodeType: "FinOSHITL"
+                  name: "ManagerReview"
+                  description: "Finance manager approves or rejects the escalated invoice."
+                  assignedRole: "finance-manager"
+                  taskType: "INVOICE_APPROVAL"
+                  timeoutSeconds: 259200
+                  allowedDecisions: ["APPROVED", "REJECTED"]
+                  escalationPolicy:
+                    escalateAfterSeconds: 86400
+                    assignedRole: "finance-director"
+                  taskContextTemplate:
+                    invoiceId: "${ .invoice_id }"
+                    amount: "${ .invoice_amount }"
+                    currency: "${ .invoice_currency }"
+                    policyReason: "${ .policy_reason }"
+              policy_node:
+                summary: Insert a FinOSPolicy node
+                value:
+                  nodeId: "node-spending-policy"
+                  nodeType: "FinOSPolicy"
+                  name: "SpendingLimitPolicy"
+                  policyDefinitionId: "def-spending-limit"
+                  possibleOutcomes: ["Success", "Escalate", "AttentionRequired", "Failed"]
+                  evaluationInputMapping:
+                    invoiceAmount: "${ .invoice_amount }"
+                    currency: "${ .invoice_currency }"
+                    vendorTier: "${ .vendor_tier }"
+                    vendorRiskScore: "${ .vendor_risk_score }"
+                    approvedSpendLimit: "${ .vendor_approved_spend_limit }"
+      responses:
+        "201":
+          description: Node inserted
+          headers:
+            Location: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeResponse' }
+        "409": { $ref: '#/components/responses/Conflict' }
+        "422": { $ref: '#/components/responses/ValidationError' }
+
+  /workflows/{workflowId}/nodes/{nodeId}:
+    parameters:
+      - $ref: '#/components/parameters/workflowId'
+      - $ref: '#/components/parameters/nodeId'
+
+    get:
+      operationId: getNode
+      summary: Retrieve a node by ID
+      tags: [Nodes]
+      parameters:
+        - name: embed
+          in: query
+          schema:
+            type: string
+            enum: [none, edges, runtimeState, full]
+            default: full
+      responses:
+        "200":
+          description: Node definition
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeResponse' }
+        "404": { $ref: '#/components/responses/NotFound' }
+
+    put:
+      operationId: replaceNode
+      summary: Full replacement of a node definition
+      description: |
+        Replaces all mutable node fields.
+        **Immutable:** `nodeId`, `nodeType`, `createdAt`.
+        Triggers DAG integrity re-validation.
+      tags: [Nodes]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NodeCreate' }
+      responses:
+        "200":
+          description: Node replaced
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeResponse' }
+        "422": { $ref: '#/components/responses/ValidationError' }
+
+    patch:
+      operationId: updateNode
+      summary: Partial update of a node (JSON Merge Patch)
+      description: |
+        Updates any mutable node fields. Common use-cases:
+
+        - Update agent task input: `{ "taskInputTemplate": { ... } }`
+        - Change HITL timeout: `{ "timeoutSeconds": 172800 }`
+        - Update policy evaluation mapping: `{ "evaluationInputMapping": { ... } }`
+        - Update API endpoint template: `{ "endpoint": "https://new-erp/v2/vendors/${ .vendor_id }" }`
+
+        **Immutable:** `nodeId`, `nodeType`, `createdAt`.
+      tags: [Nodes]
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema: { $ref: '#/components/schemas/NodePatch' }
+            examples:
+              update_hitl_timeout:
+                summary: Extend HITL timeout
+                value:
+                  timeoutSeconds: 345600
+                  escalationPolicy:
+                    escalateAfterSeconds: 86400
+                    assignedRole: "finance-director"
+              update_agent_context:
+                summary: Add request context to an agent node
+                value:
+                  requestContext:
+                    bl-roleid: "${ .role_id }"
+                    bl-periodid: "${ .period_id }"
+      responses:
+        "200":
+          description: Node updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeResponse' }
+
+    delete:
+      operationId: removeNode
+      summary: Remove a node and its incident edges from the DAG
+      description: |
+        Removes the node. All edges where this node is the source or target
+        are also deleted.
+
+        Set `?reconnectEdges=true` to automatically insert unconditional
+        edges between the removed node's predecessors and its successors,
+        preserving DAG connectivity.
+
+        Returns `409` if `reconnectEdges=false` and removal would leave
+        successor nodes unreachable.
+      tags: [Nodes]
+      parameters:
+        - name: reconnectEdges
+          in: query
+          description: Auto-reconnect predecessor→successor nodes after removal
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "204": { description: Node removed }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "409": { $ref: '#/components/responses/Conflict' }
+
+  /workflows/{workflowId}/nodes/{nodeId}/append:
+    post:
+      operationId: appendNode
+      summary: Append a new node immediately after an existing node
+      description: |
+        Convenience operation that **atomically**:
+        1. Creates the new node.
+        2. Creates an unconditional edge: `nodeId` → new node.
+        3. Optionally re-wires `nodeId`'s existing outgoing edges to originate
+           from the new node instead (set `rewireExistingEdges: true`).
+
+        This is the most common way to extend a workflow with a new sequential step.
+
+        **Example — append a fraud-check API call after vendor fetch:**
+        ```json
+        {
+          "nodeId": "node-fraud-check",
+          "nodeType": "FinOSAPI",
+          "name": "FraudCheckAPI",
+          "endpoint": "https://risk-api.example.com/v1/fraud-check",
+          "httpMethod": "POST",
+          "appendEdgeCondition": null,
+          "rewireExistingEdges": true
+        }
+        ```
+      tags: [Nodes]
+      parameters:
+        - $ref: '#/components/parameters/workflowId'
+        - $ref: '#/components/parameters/nodeId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NodeAppend' }
+      responses:
+        "201":
+          description: Node appended and edge created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      newNode: { $ref: '#/components/schemas/FinOSWorkflowNode' }
+                      createdEdge: { $ref: '#/components/schemas/FinOSWorkflowEdge' }
+                  meta: { $ref: '#/components/schemas/Meta' }
+        "409": { $ref: '#/components/responses/Conflict' }
+        "422": { $ref: '#/components/responses/ValidationError' }
+
+  /workflows/{workflowId}/nodes/{nodeId}/runtime-status:
+    patch:
+      operationId: updateNodeRuntimeStatus
+      summary: Update a node's runtime execution status
+      description: |
+        Records the runtime state of a node during workflow execution.
+        Called by the FinOS Workflows engine (via FinOS middleware) at each
+        node state transition. Persisted to the `FinOSWorkflowExecutionHistory`.
+      tags: [Nodes]
+      parameters:
+        - $ref: '#/components/parameters/workflowId'
+        - $ref: '#/components/parameters/nodeId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [runtimeStatus]
+              properties:
+                runtimeStatus:
+                  type: string
+                startedAt:
+                  type: string
+                  format: date-time
+                completedAt:
+                  type: string
+                  format: date-time
+                errorMessage:
+                  type: string
+                outputs:
+                  type: object
+                  description: Captured node outputs stored in dag_state
+            example:
+              runtimeStatus: "COMPLETED"
+              completedAt: "2026-05-18T09:00:15Z"
+              outputs:
+                invoiceCategory: "VENDOR_INVOICE"
+                totalAmount: 48500.00
+                vendorId: "vendor-acme-001"
+      responses:
+        "200":
+          description: Runtime status updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeResponse' }
+
+  /workflows/{workflowId}/nodes/{nodeId}/edges:
+    get:
+      operationId: getNodeEdges
+      summary: Get all edges incident to a node
+      tags: [Nodes, Edges]
+      parameters:
+        - $ref: '#/components/parameters/workflowId'
+        - $ref: '#/components/parameters/nodeId'
+        - name: direction
+          in: query
+          schema:
+            type: string
+            enum: [outgoing, incoming, both]
+            default: both
+      responses:
+        "200":
+          description: Edges incident to this node
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EdgeListResponse' }
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 3. Edge CRUD
+  # ───────────────────────────────────────────────────────────────────────────
+
+  /workflows/{workflowId}/edges:
+    parameters:
+      - $ref: '#/components/parameters/workflowId'
+
+    get:
+      operationId: listEdges
+      summary: List all DAG edges
+      tags: [Edges]
+      parameters:
+        - name: sourceNodeId
+          in: query
+          schema: { type: string }
+        - name: targetNodeId
+          in: query
+          schema: { type: string }
+        - name: runtimeStatus
+          in: query
+          schema: { $ref: '#/components/schemas/EdgeRuntimeStatus' }
+        - $ref: '#/components/parameters/pageSize'
+        - $ref: '#/components/parameters/pageStartIndex'
+      responses:
+        "200":
+          description: List of edges
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EdgeListResponse' }
+
+    post:
+      operationId: addEdge
+      summary: Add a directed edge with condition to the DAG
+      description: |
+        Adds a directed edge: `sourceNodeId ──▶ targetNodeId`.
+
+        **Condition syntax (jq expressions):**
+        ```
+        "${ .policy_outcome == \"Escalate\" }"          # string equality
+        "${ .invoice_amount >= 50000 }"                  # numeric comparison
+        "${ .a == \"X\" and .b < 100 }"                 # compound boolean
+        "${ .var != null }"                              # null check
+        null                                             # unconditional
+        ```
+
+        Returns `409` if the edge would introduce a cycle.
+      tags: [Edges]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EdgeCreate' }
+            examples:
+              policy_branch:
+                summary: Policy escalation edge
+                value:
+                  edgeId: "edge-03-policy-escalate"
+                  sourceNodeId: "node-spending-policy"
+                  targetNodeId: "node-hitl-manager"
+                  condition: "${ .policy_outcome == \"Escalate\" or .policy_outcome == \"AttentionRequired\" }"
+                  priority: 1
+              hitl_approved_high:
+                summary: High-value manager approval edge
+                value:
+                  edgeId: "edge-06-mgr-approved-high"
+                  sourceNodeId: "node-hitl-manager"
+                  targetNodeId: "node-hitl-cfo"
+                  condition: "${ .manager_decision == \"APPROVED\" and .invoice_amount >= 50000 }"
+                  priority: 1
+              unconditional_edge:
+                summary: Unconditional sequential edge
+                value:
+                  edgeId: "edge-02-vendor-to-policy"
+                  sourceNodeId: "node-fetch-vendor"
+                  targetNodeId: "node-spending-policy"
+                  condition: null
+      responses:
+        "201":
+          description: Edge added
+          headers:
+            Location: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EdgeResponse' }
+        "409": { $ref: '#/components/responses/Conflict' }
+        "422": { $ref: '#/components/responses/ValidationError' }
+
+  /workflows/{workflowId}/edges/{edgeId}:
+    parameters:
+      - $ref: '#/components/parameters/workflowId'
+      - $ref: '#/components/parameters/edgeId'
+
+    get:
+      operationId: getEdge
+      summary: Retrieve an edge by ID
+      tags: [Edges]
+      responses:
+        "200":
+          description: Edge definition
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EdgeResponse' }
+        "404": { $ref: '#/components/responses/NotFound' }
+
+    put:
+      operationId: replaceEdge
+      summary: Full replacement of an edge
+      description: |
+        Replaces all mutable edge fields.
+        **Immutable:** `edgeId`.
+        Triggers cycle check if endpoints change.
+      tags: [Edges]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EdgeCreate' }
+      responses:
+        "200":
+          description: Edge replaced
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EdgeResponse' }
+        "409": { $ref: '#/components/responses/Conflict' }
+
+    patch:
+      operationId: updateEdge
+      summary: Partial update of an edge (typically the condition)
+      description: |
+        Most commonly used to update the `condition` expression or `priority`.
+        **Immutable:** `edgeId`.
+      tags: [Edges]
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema: { $ref: '#/components/schemas/EdgePatch' }
+            examples:
+              tighten_threshold:
+                summary: Raise the CFO approval threshold
+                value:
+                  condition: "${ .invoice_amount >= 100000 }"
+              remove_condition:
+                summary: Make an edge unconditional
+                value:
+                  condition: null
+      responses:
+        "200":
+          description: Edge updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EdgeResponse' }
+
+    delete:
+      operationId: removeEdge
+      summary: Remove an edge from the DAG
+      description: |
+        Removes the edge. Source and target nodes are unaffected.
+        Re-validates DAG connectivity after removal.
+      tags: [Edges]
+      responses:
+        "204": { description: Edge removed }
+        "404": { $ref: '#/components/responses/NotFound' }
+
+  /workflows/{workflowId}/edges/{edgeId}/condition:
+    patch:
+      operationId: updateEdgeCondition
+      summary: Update only the condition expression of an edge
+      description: |
+        Dedicated endpoint for condition-only updates. Validates the expression
+        against the FinOS Workflows expression grammar before saving.
+        Returns `422` with a syntax error detail if the expression is invalid.
+      tags: [Edges]
+      parameters:
+        - $ref: '#/components/parameters/workflowId'
+        - $ref: '#/components/parameters/edgeId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [condition]
+              properties:
+                condition:
+                  type: string
+                  nullable: true
+                  description: |
+                    jq expression enclosed in `${ }`.
+                    Use `null` to make the edge unconditional.
+                  example: "${ .policy_outcome == \"Escalate\" and .invoice_amount > 10000 }"
+      responses:
+        "200":
+          description: Condition updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EdgeResponse' }
+        "422":
+          description: Invalid FinOS Workflows expression syntax
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ProblemDetails' }
+              example:
+                type: "https://{api-host}/finos/errors/invalid-expression"
+                title: "Invalid Expression Syntax"
+                status: 422
+                detail: "Expression '${ .policy_outcome = \"Escalate\" }' is invalid: use == for equality, not =."
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 4. Graph Operations
+  # ───────────────────────────────────────────────────────────────────────────
+
+  /workflows/{workflowId}/graph:
+    get:
+      operationId: getWorkflowGraph
+      summary: Get the full DAG in a renderable format
+      tags: [Graph]
+      parameters:
+        - $ref: '#/components/parameters/workflowId'
+        - name: format
+          in: query
+          schema:
+            type: string
+            enum: [adjacency, edgelist, cytoscape]
+            default: adjacency
+          description: |
+            - `adjacency` — per-node map of outgoing edges
+            - `edgelist` — flat list of `(source, condition, target)` tuples
+            - `cytoscape` — [Cytoscape.js](https://cytoscape.org/) elements format for direct UI rendering
+      responses:
+        "200":
+          description: DAG in requested format
+          content:
+            application/json:
+              schema: { type: object }
+
+  /workflows/{workflowId}/graph/path:
+    get:
+      operationId: findGraphPath
+      summary: Find shortest directed path between two nodes
+      tags: [Graph]
+      parameters:
+        - $ref: '#/components/parameters/workflowId'
+        - name: sourceNodeId
+          in: query
+          required: true
+          schema: { type: string }
+        - name: targetNodeId
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Shortest path
+          content:
+            application/json:
+              schema: { type: object }
+        "404":
+          description: No directed path exists between the given nodes
+
+# =============================================================================
+# COMPONENTS
+# =============================================================================
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: OAuth 2.0 / OIDC JWT from the platform identity provider (preferred)
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-FinOS-API-Key
+      description: Service-to-service machine clients
+
+  parameters:
+    workflowId:
+      name: workflowId
+      in: path
+      required: true
+      description: FinOSWorkflow definition ID
+      schema:
+        type: string
+        example: "wf-invoice-approval-v1"
+    nodeId:
+      name: nodeId
+      in: path
+      required: true
+      description: Node ID within the DAG
+      schema:
+        type: string
+        example: "node-hitl-manager"
+    edgeId:
+      name: edgeId
+      in: path
+      required: true
+      description: Edge ID within the DAG
+      schema:
+        type: string
+        example: "edge-03-policy-escalate"
+    filter:
+      name: filter
+      in: query
+      required: false
+      description: |
+        FinOS standard filter expression.
+        Syntax: `field operator "value"` optionally joined by `and`.
+        Operators: `contains` (case-insensitive substring), `eq` (exact equality).
+        Supported fields: `workflowName`, `description`, `status`, `owner`, `tenantId`.
+      schema: { type: string }
+      examples:
+        name_contains:
+          value: 'workflowName contains "invoice"'
+        status_eq:
+          value: 'status eq "PUBLISHED"'
+        compound:
+          value: 'tenantId eq "tenant-acme-prod" and status eq "PUBLISHED"'
+    sort:
+      name: sort
+      in: query
+      description: Field to sort by.
+      schema:
+        type: string
+        enum: [workflowName, status, createdAt, updatedAt]
+        default: updatedAt
+    sortOrder:
+      name: sortOrder
+      in: query
+      description: Sort direction.
+      schema:
+        type: string
+        enum: [asc, desc]
+        default: desc
+    pageSize:
+      name: pageSize
+      in: query
+      description: Number of results per page (1–200).
+      schema:
+        type: integer
+        default: 20
+        minimum: 1
+        maximum: 200
+    pageStartIndex:
+      name: pageStartIndex
+      in: query
+      description: Zero-based start index for pagination.
+      schema:
+        type: integer
+        default: 0
+        minimum: 0
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      description: Resubmitting within 24 h with the same key returns the original response
+      schema:
+        type: string
+
+  schemas:
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Enumerations
+    # ──────────────────────────────────────────────────────────────────────────
+
+    WorkflowStatus:
+      type: string
+      enum: [DRAFT, ACTIVE, DEPRECATED, ARCHIVED]
+      description: |
+        - `DRAFT` — editable; not deployed
+        - `ACTIVE` — deployed and executable; node/edge edits locked
+        - `DEPRECATED` — superseded; no new executions
+        - `ARCHIVED` — soft-deleted; data retained for audit
+
+    EdgeRuntimeStatus:
+      type: string
+      enum: [PENDING, TRAVERSED, SKIPPED]
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # FinOSWorkflow
+    # ──────────────────────────────────────────────────────────────────────────
+
+    FinOSWorkflow:
+      type: object
+      required: [workflowId, workflowName, workflowVersion, status]
+      properties:
+        workflowId:
+          type: string
+          readOnly: true
+          example: "wf-invoice-approval-v1"
+        workflowName:
+          type: string
+          example: "Invoice Approval Workflow"
+        workflowVersion:
+          type: string
+          example: "1.0.0"
+        status:
+          $ref: '#/components/schemas/WorkflowStatus'
+        description:
+          type: string
+        tenantId:
+          type: string
+        inputs:
+          type: array
+          description: |
+            Logical input contract for the workflow. Declares all variables the
+            workflow may receive. Nodes reference these as ${ .variable_name }
+            in expression fields. At execution time, config-sourced inputs are
+            loaded from tenant configuration, then run_input overlays them.
+          items:
+            type: object
+            required: [name, type, source]
+            properties:
+              name:
+                type: string
+                description: Variable name; used in ${ .name } expressions
+              type:
+                type: string
+                enum: [string, number, boolean, array, object]
+              required:
+                type: boolean
+                default: false
+              source:
+                type: string
+                enum: [runtime, config]
+                description: |
+                  runtime: must be supplied in the trigger payload each execution.
+                  config: set once by a tenant admin at workflow configuration time.
+                  Config-sourced inputs can still be overridden at runtime.
+              default:
+                description: Applied when the input is not supplied by caller
+              description:
+                type: string
+        authentication:
+          $ref: '#/components/schemas/AuthenticationSchemes'
+        nodes:
+          type: array
+          items: { $ref: '#/components/schemas/FinOSWorkflowNode' }
+        edges:
+          type: array
+          items: { $ref: '#/components/schemas/FinOSWorkflowEdge' }
+        nodeCount:
+          type: integer
+          readOnly: true
+        edgeCount:
+          type: integer
+          readOnly: true
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+        updatedAt:
+          type: string
+          format: date-time
+          readOnly: true
+
+    FinOSWorkflowCreate:
+      type: object
+      required: [workflowName, workflowVersion]
+      properties:
+        workflowId:
+          type: string
+          description: Client-supplied ID; server-generated UUID if omitted
+        workflowName: { type: string }
+        workflowVersion: { type: string }
+        status:
+          $ref: '#/components/schemas/WorkflowStatus'
+        description: { type: string }
+        tenantId: { type: string }
+        nodes:
+          type: array
+          items: { $ref: '#/components/schemas/NodeCreate' }
+        edges:
+          type: array
+          items: { $ref: '#/components/schemas/EdgeCreate' }
+
+    FinOSWorkflowPatch:
+      type: object
+      properties:
+        workflowName: { type: string }
+        workflowVersion: { type: string }
+        description: { type: string }
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Node schemas — discriminated union on nodeType
+    # ──────────────────────────────────────────────────────────────────────────
+
+    FinOSWorkflowNode:
+      type: object
+      description: Base node schema. All nine node types extend this.
+      discriminator:
+        propertyName: nodeType
+        mapping:
+          FinOSStart:      '#/components/schemas/FinOSStartNode'
+          FinOSAgent:      '#/components/schemas/FinOSAgentNode'
+          FinOSAPI:        '#/components/schemas/FinOSAPINode'
+          FinOSAsyncAPI:   '#/components/schemas/FinOSAsyncAPINode'
+          FinOSHITL:       '#/components/schemas/FinOSHITLNode'
+          FinOSPolicy:     '#/components/schemas/FinOSPolicyNode'
+          FinOSWorkflow:   '#/components/schemas/FinOSChildWorkflowNode'
+          FinOSTerminal:   '#/components/schemas/FinOSTerminalNode'
+          FinOSFanOut:     '#/components/schemas/FinOSFanOutNode'
+      required: [nodeId, nodeType, name]
+      properties:
+        nodeId:
+          type: string
+          description: Unique within the DAG
+        nodeType:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        timeoutSeconds:
+          type: integer
+          description: |
+            Per-attempt execution timeout in seconds. Defaults by node type:
+              FinOSAgent / FinOSPolicy: 300
+              FinOSAPI: 30
+              FinOSHITL / FinOSWorkflow / FinOSFanOut: 0 (no timeout)
+              FinOSStart / FinOSTerminal: not applicable
+            FinOSAsyncAPI overrides this field entirely — see FinOSAsyncAPINode.
+          default: null
+        retryPolicy:
+          $ref: '#/components/schemas/RetryPolicy'
+          description: |
+            Optional retry configuration. Not applicable to FinOSStart, FinOSHITL, or
+            FinOSTerminal. The key `retryConfig` is accepted as a backward-compatible
+            alias on ingest; new definitions should use `retryPolicy`.
+        auth:
+          $ref: '#/components/schemas/AuthConfig'
+          description: |
+            Optional per-node authentication for the node's outbound call.
+            Honoured on FinOSAgent, FinOSAPI, and FinOSAsyncAPI only. FinOSPolicy
+            and FinOSHITL call FinOS control-plane services that the engine
+            authenticates as itself; an `auth` block on such a node parses but has
+            no effect. FinOSStart, FinOSWorkflow, FinOSFanOut, and FinOSTerminal
+            make no outbound call of their own.
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+        updatedAt:
+          type: string
+          format: date-time
+          readOnly: true
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Node authentication — per-node `auth` and workflow-level `authentication`
+    # ──────────────────────────────────────────────────────────────────────────
+
+    AuthConfig:
+      description: |
+        Per-node authentication. Either the string `none` (an explicitly
+        unauthenticated call), or a mapping.
+
+        A mapping's **category** is identified by the fields present, and
+        `grantType` is what identifies the two OAuth categories:
+
+        | Category | Identified by | Acts as |
+        |---|---|---|
+        | `oauth2cc` | `grantType: client_credentials` | the service itself |
+        | `oauth2RO` | `grantType: urn:ietf:params:oauth:grant-type:token-exchange` | the resource owner (the user) |
+        | `apiKey` | `header` + `value` (no `grantType`) | a static key in a request header |
+
+        A mapping may instead (or additionally) carry `schemeRef`, naming a
+        credential declared in the workflow-level `authentication` block. Node
+        fields override the referenced scheme field by field; `scopes` replaces
+        rather than adds.
+
+        **Secret values never appear in a workflow definition.** `tokenUrl`,
+        `clientId`, and `clientSecret` carry opaque, platform-recognized
+        references — not expressions and not raw values — which the platform maps
+        to real secrets and endpoints through its own configuration. `apiKey`'s
+        `value` is the one exception in form only: it is a workflow-context
+        expression resolved with environment access disabled, never a literal.
+
+        See §2.2 of `0-finos-workflow-guide.md`.
+      oneOf:
+        - type: string
+          enum: [none]
+        - $ref: '#/components/schemas/AuthCredential'
+
+    AuthCredential:
+      type: object
+      description: |
+        A credential block, inline on a node or declared under a system in the
+        workflow-level `authentication` map.
+      properties:
+        schemeRef:
+          type: string
+          description: |
+            Node-level only. Dotted path to a declared credential —
+            `<system>.<category>`, e.g. `platform.oauth2cc`. The literal
+            `jwt_passthrough` and the `bearer` category are not supported and are
+            rejected outright.
+          example: "platform.oauth2cc"
+        grantType:
+          type: string
+          description: |
+            Required for both OAuth categories, on the node or on the scheme it
+            references. It is the only input to the engine's choice of token flow,
+            so a definition that omits it is rejected at registration time. The key
+            is camelCase — `grant_type` is an unknown field and is ignored.
+          enum:
+            - client_credentials
+            - urn:ietf:params:oauth:grant-type:token-exchange
+        scopes:
+          type: array
+          items: { type: string }
+          description: |
+            Scopes this node requests (least privilege). Written as a list; the
+            engine collapses it to the space-delimited form the OAuth2 `scope`
+            parameter expects. A node that declares any scope replaces the scheme's
+            set outright.
+          example: ["bl.finos.read"]
+        tokenUrl:
+          type: string
+          description: |
+            `oauth2cc` only. The OAuth2 token endpoint, as a platform-recognized URL
+            reference. Omit for the platform's own system — the platform supplies its
+            own endpoint. Required for any other system.
+          example: "SAP_TOKEN_URL"
+        clientId:
+          type: string
+          description: |
+            `oauth2cc` only. OAuth2 `client_id`, as a platform-recognized credential
+            reference. Same omit/require rule as `tokenUrl`.
+          example: "SAP_CLIENT_ID"
+        clientSecret:
+          type: string
+          description: |
+            `oauth2cc` only. OAuth2 `client_secret`, as a platform-recognized
+            credential reference. Same omit/require rule as `tokenUrl`.
+          example: "SAP_CLIENT_SECRET"
+        userId:
+          type: string
+          description: |
+            `oauth2RO` only, and node-level only — there is no scheme-level
+            counterpart. Selects the resource owner this node acts as. Omit to use
+            the run's own user. May be an explicit value or a `${ }` expression
+            resolved from the workflow's configuration. Read only when the effective
+            grant type is the token-exchange URN; inert otherwise.
+          example: "48213"
+        header:
+          type: string
+          description: |
+            `apiKey` only. The (non-secret) header name. A block with no header name
+            is refused.
+          example: "X-Api-Key"
+        value:
+          type: string
+          description: |
+            `apiKey` only. A workflow-context expression that resolves to the key.
+            Literals and constants are rejected, and the expression is resolved with
+            environment access disabled, so it can never read a process-env secret.
+          example: "${ .api_key }"
+
+    AuthenticationSchemes:
+      type: object
+      description: |
+        Optional workflow-level credential declarations — a two-level map of
+        *system* → *credential category* → fields. It exists only to stop repeating
+        a credential that several nodes share; a workflow whose nodes all declare
+        their credentials inline has no `authentication` block at all.
+
+        The system name is author-chosen and free-form. One system name is reserved
+        for the platform itself (`platform` in these examples; the actual name is
+        platform configuration): the platform's own credential and endpoint
+        references — including by omission — and the `oauth2RO` flow in its entirety
+        are reserved to it, and a conforming engine refuses both to any other system.
+      additionalProperties:
+        type: object
+        description: Credential categories offered by one system.
+        properties:
+          oauth2cc:
+            $ref: '#/components/schemas/AuthCredential'
+          oauth2RO:
+            $ref: '#/components/schemas/AuthCredential'
+          apiKey:
+            $ref: '#/components/schemas/AuthCredential'
+        additionalProperties: false
+      example:
+        platform:
+          oauth2cc:
+            grantType: client_credentials
+            scopes: ["bl.finos.read"]
+          oauth2RO:
+            grantType: "urn:ietf:params:oauth:grant-type:token-exchange"
+        sapErp:
+          oauth2cc:
+            grantType: client_credentials
+            tokenUrl: SAP_TOKEN_URL
+            clientId: SAP_CLIENT_ID
+            clientSecret: SAP_CLIENT_SECRET
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # FinOSStart — explicit workflow entry point
+    # ──────────────────────────────────────────────────────────────────────────
+
+    FinOSStartNode:
+      description: |
+        A FinOSStart node marks the entry point of a workflow DAG. Every DAG
+        must contain exactly one FinOSStart node, with zero incoming edges.
+
+        FinOSStart carries no node-specific fields. Outgoing edges use the
+        same condition/priority routing as every other node (see Edge
+        schema).
+      allOf:
+        - $ref: '#/components/schemas/FinOSWorkflowNode'
+
+    FinOSAgentNode:
+      description: |
+        A FinOSAgent node invokes an LLM agent via the A2A protocol
+        (FinOS Agent Runtime) over the A2A protocol.
+      allOf:
+        - $ref: '#/components/schemas/FinOSWorkflowNode'
+        - type: object
+          required: [agentId]
+          properties:
+            agentId:
+              type: string
+              description: Agent identifier in the FinOS Agent Registry
+              example: "agt-invoice-classifier-001"
+            taskInputTemplate:
+              type: object
+              description: |
+                A2A task `input` block template. String values may contain
+                jq expression syntax: `"${ .workflow_var }"`.
+            outputMapping:
+              type: object
+              additionalProperties:
+                type: string
+              description: |
+                Maps agent response fields into workflow context. Keys are context
+                variable names; values are jq expressions evaluated against the agent
+                response JSON. Use "${ . }" to map the entire response.
+              example:
+                analysis_result: "${ .result }"
+                full_response: "${ . }"
+            requestContext:
+              type: object
+              additionalProperties:
+                type: string
+              description: |
+                Optional author-defined metadata injected into the A2A message.metadata
+                envelope (or as HTTP headers for non-A2A agents). Values support jq
+                expression syntax resolved against workflow context at runtime.
+                Common use: tenant/identity context (bl-roleid, bl-periodid, etc.).
+                The runtime automatically injects traceId, spanId, correlationId,
+                tenantId, and workflowInstanceId — authors do not declare these.
+              example:
+                bl-roleid: "${ .role_id }"
+                bl-periodid: "${ .period_id }"
+
+    FinOSAPINode:
+      description: |
+        A FinOSAPI node calls an external REST endpoint.
+        Issues the request with the node's method, headers, query and body.
+      allOf:
+        - $ref: '#/components/schemas/FinOSWorkflowNode'
+        - type: object
+          required: [endpoint, httpMethod]
+          properties:
+            endpoint:
+              type: string
+              description: |
+                REST endpoint URL. Supports FinOS Workflows variable references
+                in path segments: `https://erp.example.com/vendors/${ .vendor_id }`.
+            httpMethod:
+              type: string
+              enum: [GET, POST, PUT, PATCH, DELETE]
+            requestHeaders:
+              type: object
+              additionalProperties: { type: string }
+              description: |
+                HTTP headers. Values MUST be strings — quote literals YAML would
+                otherwise type (e.g. "0", "true"). Do not set Content-Length by
+                hand; the engine's HTTP client computes it. Values may contain
+                jq expression references (`${ .var }`); the resolved value is
+                coerced to a string. See guide §3.2.2.
+            requestBody:
+              description: |
+                JSON request body for POST/PUT/PATCH. Either a mapping whose
+                values may contain jq expression references (`${ .var }`), or a
+                single full-value `${ }` expression that resolves to a JSON
+                value. Use `{}` for an empty body (never ''). If a workflow input
+                holds a JSON document as a string, parse it with jq `fromjson`
+                (e.g. "${ .payload | fromjson }") so it is sent as an object, not
+                a quoted string. See guide §3.2.2.
+              oneOf:
+                - type: object
+                - type: string
+              example:
+                invoiceId: "${ .invoice_id }"
+            queryParams:
+              type: object
+              additionalProperties: { type: string }
+              description: Query-string parameters. Values MUST be strings; may contain jq expression references.
+            responseMapping:
+              type: object
+              additionalProperties:
+                type: string
+              description: |
+                Maps API response fields into workflow context. Keys are context variable
+                names; values are jq expressions evaluated against the API response JSON.
+                Use "${ . }" to map the entire response.
+              example:
+                vendor_name: "${ .data.name }"
+
+    AsyncAPITokenInjection:
+      type: object
+      description: |
+        Where to place a token (resumeToken or callback URL) in the outbound
+        kickoff request for a FinOSAsyncAPI node.
+      required: [location, field]
+      properties:
+        location:
+          type: string
+          enum: [body, header, queryParam]
+          description: |
+            Where the token is placed in the kickoff request. `body` inserts it
+            at the top level of the JSON request body under `field` and
+            therefore requires the node's `requestBody` to resolve to a JSON
+            object; `header` and `queryParam` add it as a string metadata entry.
+        field:
+          type: string
+          description: |
+            Partner-defined field/header/param name; the partner echoes this
+            value back verbatim on completion.
+          example: "callbackReference"
+
+    FinOSAsyncAPINode:
+      description: |
+        A FinOSAsyncAPI node fires an initial request that kicks off a
+        long-running job on a partner system (minutes to days) and suspends
+        workflow execution until a completion notification arrives — via an
+        authenticated HTTP callback or an internal event. Unlike FinOSAPI,
+        the initial HTTP response is not the result; the eventual
+        callback/event payload is. Unlike FinOSHITL, resolution is a system
+        completing work on its own schedule, not a human decision.
+      allOf:
+        - $ref: '#/components/schemas/FinOSWorkflowNode'
+        - type: object
+          required: [endpoint, httpMethod, callbackMode, resumeTokenInjection, timeoutSeconds]
+          properties:
+            endpoint:
+              type: string
+              description: |
+                REST endpoint that kicks off the partner's long-running job.
+                Supports jq expression references in path segments, same as
+                FinOSAPI's endpoint field.
+            httpMethod:
+              type: string
+              enum: [GET, POST, PUT, PATCH, DELETE]
+            requestHeaders:
+              type: object
+              additionalProperties: { type: string }
+              description: |
+                HTTP headers for the kickoff request. Values MUST be strings —
+                quote literals YAML would otherwise type (e.g. "0"). Do not set
+                Content-Length by hand. Values may contain jq expression
+                references (`${ .var }`); the resolved value is coerced to a
+                string. Same rules as FinOSAPI — see guide §3.2.2.
+            requestBody:
+              description: |
+                JSON body for the kickoff request. Either a mapping whose values
+                may contain jq expression references (`${ .var }`), or a single
+                full-value `${ }` expression that resolves to a JSON value. Use
+                `{}` for an empty body (never ''). Parse JSON-string inputs with
+                jq `fromjson`. Same rules as FinOSAPI — see guide §3.2.2.
+                Note: if `resumeTokenInjection` or `callbackUrlInjection` uses
+                `location: body`, this MUST resolve to a JSON object so the
+                token field can be inserted; a non-object body is rejected at
+                execution.
+              oneOf:
+                - type: object
+                - type: string
+            queryParams:
+              type: object
+              additionalProperties: { type: string }
+              description: Query-string parameters. Values MUST be strings; may contain jq expression references.
+            callbackMode:
+              type: string
+              enum: [HTTP, EVENT]
+              description: |
+                HTTP: the partner POSTs completion to a callback endpoint
+                provided by the FinOS Workflows Engine, embedding the
+                resumeToken.
+                EVENT: an internal platform adapter service publishes
+                completion to the shared internal event topic on the
+                partner's behalf; the partner never publishes directly.
+            resumeTokenInjection:
+              allOf:
+                - $ref: '#/components/schemas/AsyncAPITokenInjection'
+              description: |
+                Where to inject the resumeToken into the outbound kickoff
+                request so the partner can echo it back on completion.
+            callbackUrlInjection:
+              allOf:
+                - $ref: '#/components/schemas/AsyncAPITokenInjection'
+              description: |
+                Only meaningful when callbackMode: HTTP — where to inject the
+                callback URL (provided by the FinOS Workflows Engine and
+                embedding the resumeToken) into the outbound kickoff request.
+                Omitted entirely for callbackMode: EVENT; there is no URL to
+                inject.
+            resultMapping:
+              type: object
+              additionalProperties:
+                type: string
+              description: |
+                Maps the eventual callback/event payload's `result` object
+                into workflow context. Keys are context variable names;
+                values are jq expressions evaluated against `result`.
+              example:
+                reconciliation_status: "${ .result.status }"
+                discrepancy_count: "${ .result.discrepancies | length }"
+            timeoutSeconds:
+              type: integer
+              description: |
+                Real business deadline for the async job — the authoritative
+                timeout for this node type, enforced by the FinOS Workflows
+                Engine. Unlike the base FinOSWorkflowNode.timeoutSeconds (a
+                per-attempt execution timeout), this is a total wall-clock
+                deadline from job kickoff to resolution.
+            statusCheckConfig:
+              allOf:
+                - $ref: '#/components/schemas/FinOSAsyncAPIStatusCheckConfig'
+              description: |
+                Optional. Disambiguates a lost notification from an
+                actually-incomplete job before the engine fails or retries
+                the node on timeoutSeconds expiry. When absent, expiry falls
+                back to pure elapsed-time behavior (fail immediately, subject
+                to the node's retryPolicy).
+
+    FinOSAsyncAPIStatusCheckConfig:
+      type: object
+      description: |
+        Optional pre-fail/pre-retry status-check step for a FinOSAsyncAPI
+        node's sweep. Not every partner exposes a status-check endpoint —
+        nodes without this fall back to pure elapsed-time expiry behavior.
+      required: [endpoint, httpMethod, statusPath, succeededValues, failedValues]
+      properties:
+        endpoint:
+          type: string
+          description: |
+            Status-check URL. Either a literal URL, or a jq expression
+            evaluated against the kickoff response body when the partner
+            returns a per-job status URL.
+
+            Note the evaluation root differs from the node's top-level
+            resultMapping: that binds to the completion payload's `result`
+            object, whereas this binds to the kickoff response body. A
+            conforming engine resolves this expression at kickoff time,
+            while the kickoff response is in hand, and retains the resolved
+            URL for the lifetime of the node — the status check may run long
+            after the kickoff response would otherwise be discarded.
+          example: "${ .statusUrl }"
+        httpMethod:
+          type: string
+          enum: [GET, POST]
+        statusPath:
+          type: string
+          description: JSONPath into the status-check response identifying the status field.
+          example: "$.data.status"
+        succeededValues:
+          type: array
+          items: { type: string }
+          description: Status values indicating the job completed successfully.
+        failedValues:
+          type: array
+          items: { type: string }
+          description: Status values indicating the job failed terminally.
+        resultMapping:
+          type: object
+          additionalProperties:
+            type: string
+          description: |
+            Maps the status-check response into workflow context on a
+            succeeded outcome. Same jq-expression semantics as the node's
+            top-level resultMapping, evaluated against the status-check
+            response instead of the callback/event payload.
+
+    FinOSAsyncAPICallbackPayload:
+      type: object
+      description: |
+        Identical shape for both callbackMode transports (HTTP POST body or
+        EVENT message payload). resumeToken is a bearer-equivalent
+        credential — a conforming implementation must mask it in logs,
+        never log it in full.
+      required: [resumeToken, status]
+      properties:
+        resumeToken:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [SUCCEEDED, FAILED]
+        result:
+          type: object
+          additionalProperties: true
+          description: |
+            Partner-specific payload, mapped via the node's resultMapping
+            (or statusCheckConfig.resultMapping on the status-check path).
+        error:
+          type: object
+          properties:
+            code: { type: string }
+            message: { type: string }
+
+    FinOSHITLNode:
+      description: |
+        A FinOSHITL node suspends workflow execution pending a human decision.
+        The engine creates the reviewer callback and suspends the instance until a decision arrives.
+        The generated callback URL is POSTed to a FinOSHITLEvent vertex and sent to
+        the notification service for task assignment.
+      allOf:
+        - $ref: '#/components/schemas/FinOSWorkflowNode'
+        - type: object
+          required: [assignedRole, timeoutSeconds]
+          properties:
+            assignedRole:
+              type: string
+              description: Role responsible for the HITL decision
+              example: "finance-manager"
+            assignedTeamId:
+              type: string
+              description: Identifier of team responsible for the HITL decision.
+            assignedUserId:
+              type: string
+              description: Specific user override (takes precedence over assignedRole)
+            taskType:
+              type: string
+              example: "INVOICE_APPROVAL"
+            taskInstructions:
+              type: string
+              description: Human-readable instructions shown in the task UI
+            taskContextTemplate:
+              type: object
+              description: |
+                Context data template passed to the HITL task UI.
+                Values may contain jq expression references (`${ .var }`).
+            timeoutSeconds:
+              type: integer
+              minimum: 0
+              maximum: 2592000
+              description: Maximum wait time; raises TimeoutError after expiry
+            escalationPolicy:
+              type: object
+              properties:
+                escalateAfterSeconds: { type: integer }
+                assignedRole:
+                  type: string
+                  description: Role the task escalates to
+                assignedTeamId:
+                  type: string
+                  description: Team the task escalates to
+                assignedUserId:
+                  type: string
+                  description: Specific user the task escalates to
+            allowedDecisions:
+              type: array
+              items:
+                type: string
+              description: |
+                Optional validation list. When provided, the HITL Service rejects
+                callbacks whose decision value is not in this list. No canonical
+                values are mandated — workflow authors define their own vocabulary.
+                The submitted decision becomes available as ${ .decision } in
+                workflow context for outgoing edge conditions.
+            uiComponentId:
+              type: string
+              description: |
+                Plugin identifier resolved against the HITL Plugin Registry
+                (PluginId in Services.Hitl). The HITL shell uses this to
+                dynamically load the reviewer's UI component via Module Federation.
+                When omitted, the shell falls back to its default plugin chain.
+              example: "document-selection-panel"
+
+    FinOSPolicyNode:
+      description: |
+        Evaluates a policy via the FinOS Policy Service.
+        The policy service endpoint is configured globally via environment
+        variable — per-node endpoint overrides are not supported (security
+        constraint: prevents routing policy evaluation to untrusted endpoints).
+
+        The node references a tenant-agnostic **Policy Definition** by
+        `policyDefinitionId`. The calling tenant's **Policy Configuration** for
+        this `(workflowConfigId, nodeId)` placement is resolved by the Policy
+        Service at evaluate time and supplies the actual condition and
+        enforcement — the workflow definition never carries tenant-specific
+        thresholds. See `4-finos-policy-guide.md`.
+      allOf:
+        - $ref: '#/components/schemas/FinOSWorkflowNode'
+        - type: object
+          anyOf:
+            - required: [policyDefinitionId]
+            - required: [policyId]
+          properties:
+            policyDefinitionId:
+              type: string
+              description: |
+                Identifier of the tenant-agnostic Policy Definition whose shape
+                (`variables`, `possibleOutcomes`) governs this node. Preferred
+                over `policyId` in all new workflow definitions.
+              example: "def-spending-limit"
+            policyId:
+              type: string
+              description: |
+                **Deprecated.** Legacy identifier of a standalone policy, retained
+                for workflow definitions authored before the Definition /
+                Configuration split. Use `policyDefinitionId` instead. A definition
+                that sets both is rejected at registration when they disagree.
+              deprecated: true
+              example: "pol-spending-limit-v3"
+            evaluationInputMapping:
+              type: object
+              description: |
+                Maps workflow variables to policy evaluation input fields. Keys must
+                match variables declared with source `EVALUATION_INPUT` on the pinned
+                Policy Definition version; values may be `${ }` expressions.
+              example:
+                invoiceAmount: "${ .invoice_amount }"
+                currency: "${ .invoice_currency }"
+                vendorTier: "${ .vendor_tier }"
+                vendorRiskScore: "${ .vendor_risk_score }"
+            possibleOutcomes:
+              type: array
+              items: { type: string }
+              description: |
+                Optional list of all outcome values this policy can return, drawn from
+                the referenced Policy Definition's `possibleOutcomes` (a closed
+                allow-list). When provided it must be non-empty; every value must
+                appear in at least one outgoing edge condition (enforced by the DAG
+                validator). When omitted, the list is inherited from the Definition and
+                outcomes are inferred from edge conditions at design-time validation.
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # FinOSTerminal — explicit workflow terminal
+    # ──────────────────────────────────────────────────────────────────────────
+
+    FinOSTerminalNode:
+      description: |
+        A FinOSTerminal node is an explicit, typed workflow terminal. Every DAG must
+        contain at least one FinOSTerminal. Terminal nodes have no outgoing edges.
+
+        Using an explicit type (rather than implicitly leaving a targetNodeId
+        undefined) enables:
+          - Structured exit semantics (COMPLETED vs FAILED)
+          - Human-readable outcome labels surfaced in execution history and UI
+          - Design-time DAG validation (the integrity rule "all edge endpoints
+            reference an existing node" is enforceable)
+
+        **Degenerate-input policy convention:** A FinOSPolicy node that may receive
+        structurally degenerate inputs (e.g. empty collection, null value) must
+        define a distinct outcome for each such case (e.g. `NO_ITEMS`,
+        `INSUFFICIENT_DATA`) with a matching outgoing edge that routes to an
+        appropriate FinOSTerminal. Returning a normal-path outcome (e.g.
+        `REQUIRE_HITL`) for a degenerate input is a policy specification error — it
+        routes the workflow into a gate with no meaningful context for the reviewer.
+      allOf:
+        - $ref: '#/components/schemas/FinOSWorkflowNode'
+        - type: object
+          required: [exitStatus]
+          properties:
+            exitStatus:
+              type: string
+              enum: [COMPLETED, FAILED]
+              description: |
+                COMPLETED — a valid business outcome (approved, no-items, auto-approved, etc.).
+                FAILED    — the workflow could not proceed (escalation exhausted, unrecoverable error).
+            label:
+              type: string
+              description: |
+                Human-readable outcome label. Surfaced in the Execution History API
+                and workflow UI to distinguish multiple COMPLETED terminals.
+              example: "No Supporting Items — valid close outcome"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # FinOSFanOut — parallel child-workflow fan-out over a collection
+    # ──────────────────────────────────────────────────────────────────────────
+
+    FinOSFanOutNode:
+      description: |
+        A FinOSFanOut node iterates over an array in the parent workflow state,
+        spawning one child FinOSWorkflow execution per item. The parent waits for
+        all children to complete (or for the first to complete, in compete mode)
+        before traversing its outgoing edge.
+
+        FinOSFanOut is distinct from a general fork/join primitive: it always
+        fans out to registered child workflows (not arbitrary node groups), enabling
+        per-item HITL gates, per-item retries, and independent audit trails.
+
+        The child workflow is resolved by `workflowId` from the Workflow
+        Registry at runtime; no runtime-vendor details are encoded in the YAML.
+      allOf:
+        - $ref: '#/components/schemas/FinOSWorkflowNode'
+        - type: object
+          required: [workflowId, iterateOver, iterationVar]
+          properties:
+            workflowId:
+              type: string
+              description: Child workflow resolved from the Workflow Registry at runtime.
+              example: "wf-account-prepare-v1"
+            iterateOver:
+              type: string
+              description: |
+                Expression (e.g. `${ .account_ids }`) resolving to the array in the
+                parent workflow state to iterate over.
+              example: "${ .account_ids }"
+            iterationVar:
+              type: string
+              description: Name of the loop variable bound to each array item during iteration.
+              example: "account_id"
+            taskInputTemplate:
+              type: object
+              additionalProperties: { type: string }
+              description: |
+                Expression map that builds each child workflow's run_input from the
+                parent context. String values may contain `${ }` expression syntax.
+              example:
+                account_id: "${ .account_id }"
+                period_id:  "${ .period_id }"
+                role_id:    "${ .role_id }"
+            parallel:
+              type: boolean
+              default: true
+              description: |
+                When true (default), all child workflows launch concurrently and the
+                parent waits for all to complete before traversing its outgoing edge.
+                When false, items are processed sequentially.
+            outputKey:
+              type: string
+              description: |
+                State key under which the map of per-item child results is written
+                into the parent context after all children complete.
+              example: "prepare_results"
+            timeoutSeconds:
+              type: integer
+              default: 0
+              description: |
+                Maximum seconds to wait for all child workflows to complete.
+                Defaults to 0 (no timeout). In sequential mode, applied per child.
+
+    FinOSChildWorkflowNode:
+      description: |
+        A FinOSWorkflow node invokes another registered workflow as a durable child
+        execution. Unlike FinOSAgent (A2A HTTP), child workflow invocations are
+        orchestration-native — they can wait indefinitely for HITL gates without
+        timing out the parent. The child workflow is resolved by `workflowId`
+        from the Workflow Registry at runtime; the Workflow Registry supplies the
+        execution target (routingKey).
+      allOf:
+        - $ref: '#/components/schemas/FinOSWorkflowNode'
+        - type: object
+          required: [workflowId, taskInputTemplate]
+          properties:
+            workflowId:
+              type: string
+              description: |
+                ID of the registered workflow definition in the Workflow Registry.
+                The registry resolves execution routing (routingKey) at runtime —
+                the workflow YAML never encodes runtime-vendor details.
+              example: "wf-account-prepare-v1"
+            taskInputTemplate:
+              type: object
+              description: |
+                Expression map that builds the child workflow's run_input from the
+                parent context. String values may contain `${ }` expression syntax.
+              example:
+                account_id: "${ .account_id }"
+                period_id:  "${ .period_id }"
+                role_id:    "${ .role_id }"
+            outputMapping:
+              type: object
+              additionalProperties:
+                type: string
+              description: Maps child workflow output fields into parent context. Values are jq expressions.
+              example:
+                prepare_result: "${ . }"
+
+    FinOSWorkflowEdge:
+      type: object
+      required: [edgeId, sourceNodeId, targetNodeId]
+      properties:
+        edgeId:
+          type: string
+          description: Unique edge identifier within the DAG
+        sourceNodeId:
+          type: string
+        targetNodeId:
+          type: string
+          description: Must reference a node defined in the nodes list (including FinOSTerminal nodes)
+        condition:
+          type: string
+          description: |
+            jq expression evaluated against workflow context. Required when the source
+            node has more than one outgoing edge. When omitted, edge is traversed
+            unconditionally (only valid for single-outgoing-edge nodes).
+          example: "${ .policy_outcome == 'ESCALATE' }"
+        priority:
+          type: integer
+          description: |
+            Evaluation order when source node has multiple outgoing edges.
+            Lower number = evaluated first. When omitted, list order in the edges
+            array is used.
+          default: null
+        runtimeStatus:
+          $ref: '#/components/schemas/EdgeRuntimeStatus'
+        runtimeTraversedAt:
+          type: string
+          format: date-time
+          readOnly: true
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+        updatedAt:
+          type: string
+          format: date-time
+          readOnly: true
+
+    EdgeCreate:
+      type: object
+      required: [edgeId, sourceNodeId, targetNodeId]
+      properties:
+        edgeId: { type: string }
+        sourceNodeId: { type: string }
+        targetNodeId: { type: string }
+        condition:
+          type: string
+          nullable: true
+        priority:
+          type: integer
+          default: null
+
+    EdgePatch:
+      type: object
+      properties:
+        condition:
+          type: string
+          nullable: true
+        priority: { type: integer }
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Node create / insert / append / patch schemas
+    # ──────────────────────────────────────────────────────────────────────────
+
+    NodeCreate:
+      description: |
+        Polymorphic node creation payload. Include `nodeType` as discriminator.
+        Additional type-specific fields are specified inline alongside base fields.
+      type: object
+      required: [nodeId, nodeType, name]
+      properties:
+        nodeId: { type: string }
+        nodeType: { type: string }
+        name: { type: string }
+        description: { type: string }
+        timeoutSeconds: { type: integer }
+        retryPolicy: { $ref: '#/components/schemas/RetryPolicy' }
+        auth: { $ref: '#/components/schemas/AuthConfig' }
+        # FinOSAgent fields
+        agentId: { type: string }
+        taskInputTemplate: { type: object }
+        outputMapping: { type: object }
+        requestContext: { type: object }
+        # FinOSAPI / FinOSAsyncAPI fields
+        endpoint: { type: string }
+        httpMethod: { type: string, enum: [GET, POST, PUT, PATCH, DELETE] }
+        requestHeaders: { type: object }
+        requestBody: { type: object }
+        queryParams: { type: object }
+        responseMapping: { type: object }
+        # FinOSAsyncAPI fields
+        callbackMode: { type: string, enum: [HTTP, EVENT] }
+        resumeTokenInjection: { $ref: '#/components/schemas/AsyncAPITokenInjection' }
+        callbackUrlInjection: { $ref: '#/components/schemas/AsyncAPITokenInjection' }
+        resultMapping: { type: object }
+        statusCheckConfig: { $ref: '#/components/schemas/FinOSAsyncAPIStatusCheckConfig' }
+        # FinOSHITL fields
+        assignedRole: { type: string }
+        assignedTeamId: { type: string }
+        assignedUserId: { type: string }
+        taskType: { type: string }
+        taskInstructions: { type: string }
+        taskContextTemplate: { type: object }
+        escalationPolicy: { type: object }
+        allowedDecisions: { type: array, items: { type: string } }
+        uiComponentId: { type: string }
+        # FinOSPolicy fields
+        policyDefinitionId: { type: string }
+        policyId: { type: string, deprecated: true }
+        evaluationInputMapping: { type: object }
+        possibleOutcomes: { type: array, items: { type: string } }
+        # FinOSWorkflow (child) / FinOSFanOut fields
+        workflowId: { type: string }
+        iterateOver: { type: string }
+        iterationVar: { type: string }
+        outputKey: { type: string }
+        parallel: { type: boolean }
+        # FinOSTerminal fields
+        exitStatus: { type: string, enum: [COMPLETED, FAILED] }
+        label: { type: string }
+
+    NodeInsert:
+      description: NodeCreate extended with optional auto-edge creation options
+      allOf:
+        - $ref: '#/components/schemas/NodeCreate'
+        - type: object
+          properties:
+            insertAfterNodeId:
+              type: string
+              description: |
+                If set, automatically creates an unconditional edge:
+                `insertAfterNodeId` → new node.
+            insertBeforeNodeId:
+              type: string
+              description: |
+                If set, automatically creates an unconditional edge:
+                new node → `insertBeforeNodeId`.
+            insertEdgeCondition:
+              type: string
+              nullable: true
+              description: Condition for the auto-created edge. `null` = unconditional.
+
+    NodeAppend:
+      description: NodeCreate extended with append-specific options
+      allOf:
+        - $ref: '#/components/schemas/NodeCreate'
+        - type: object
+          properties:
+            appendEdgeCondition:
+              type: string
+              nullable: true
+              description: |
+                Condition for the auto-created edge from the parent node.
+                `null` = unconditional.
+            rewireExistingEdges:
+              type: boolean
+              default: false
+              description: |
+                If `true`, the parent node's existing outgoing edges are re-wired
+                to originate from the new node instead, placing it in the middle
+                of an existing path.
+
+    NodePatch:
+      description: Partial update payload — include only fields to change
+      type: object
+      properties:
+        name: { type: string }
+        description: { type: string }
+        timeoutSeconds: { type: integer }
+        retryPolicy: { $ref: '#/components/schemas/RetryPolicy' }
+        auth: { $ref: '#/components/schemas/AuthConfig' }
+        # FinOSAgent
+        agentId: { type: string }
+        taskInputTemplate: { type: object }
+        outputMapping: { type: object }
+        requestContext: { type: object }
+        # FinOSAPI / FinOSAsyncAPI
+        endpoint: { type: string }
+        httpMethod: { type: string }
+        requestHeaders: { type: object }
+        requestBody: { type: object }
+        queryParams: { type: object }
+        responseMapping: { type: object }
+        # FinOSAsyncAPI
+        callbackMode: { type: string, enum: [HTTP, EVENT] }
+        resumeTokenInjection: { $ref: '#/components/schemas/AsyncAPITokenInjection' }
+        callbackUrlInjection: { $ref: '#/components/schemas/AsyncAPITokenInjection' }
+        resultMapping: { type: object }
+        statusCheckConfig: { $ref: '#/components/schemas/FinOSAsyncAPIStatusCheckConfig' }
+        # FinOSHITL
+        assignedRole: { type: string }
+        assignedTeamId: { type: string }
+        assignedUserId: { type: string }
+        taskType: { type: string }
+        taskInstructions: { type: string }
+        taskContextTemplate: { type: object }
+        escalationPolicy: { type: object }
+        allowedDecisions: { type: array, items: { type: string } }
+        uiComponentId: { type: string }
+        # FinOSPolicy
+        policyDefinitionId: { type: string }
+        policyId: { type: string, deprecated: true }
+        evaluationInputMapping: { type: object }
+        possibleOutcomes: { type: array, items: { type: string } }
+        # FinOSWorkflow (child) / FinOSFanOut
+        workflowId: { type: string }
+        iterateOver: { type: string }
+        iterationVar: { type: string }
+        outputKey: { type: string }
+        parallel: { type: boolean }
+        # FinOSTerminal
+        exitStatus: { type: string, enum: [COMPLETED, FAILED] }
+        label: { type: string }
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Supporting schemas
+    # ──────────────────────────────────────────────────────────────────────────
+
+    RetryPolicy:
+      type: object
+      description: |
+        Retry configuration for node execution. maxRetries defines additional
+        attempts after the first failure.
+        Maps to the total attempt count in the underlying execution runtime:
+        total attempts = maxRetries + 1 (the initial attempt plus each retry).
+      properties:
+        maxRetries:
+          type: integer
+          default: 3
+          description: Additional attempts after first failure (not including the initial attempt)
+        initialDelaySeconds:
+          type: number
+          default: 1
+        maxDelaySeconds:
+          type: number
+          default: 30
+        multiplier:
+          type: number
+          default: 2.0
+          description: Exponential backoff coefficient
+        nonRetryableErrorTypes:
+          type: array
+          items: { type: string }
+          default: []
+          description: |
+            Error type names that must not be retried. Unioned with the platform's own
+            defaults — an empty list means platform defaults only.
+
+    ValidationResult:
+      type: object
+      properties:
+        valid: { type: boolean }
+        checkedAt:
+          type: string
+          format: date-time
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              rule: { type: string }
+              message: { type: string }
+              nodeId: { type: string }
+              edgeId: { type: string }
+        warnings:
+          type: array
+          items:
+            type: object
+            properties:
+              rule: { type: string }
+              message: { type: string }
+
+    WorkflowRunRequest:
+      type: object
+      required: [tenantId]
+      properties:
+        tenantId:
+          type: string
+        run_input:
+          type: object
+          additionalProperties: true
+          description: |
+            Key-value map of runtime inputs. Merged with tenant config values
+            at execution time (run_input overlays config). Required inputs
+            absent from both sources cause the trigger to be rejected.
+
+    WorkflowRunResult:
+      type: object
+      properties:
+        instanceId:
+          type: string
+          description: Unique execution instance identifier
+        status:
+          type: string
+          enum: [RUNNING, QUEUED]
+
+    WorkflowRegistryEntry:
+      type: object
+      properties:
+        workflowId:
+          type: string
+          description: Matches the workflowId on the FinOSWorkflow definition
+        routingKey:
+          type: string
+          description: |
+            Runtime routing identifier provided at workflow registration time.
+            The interpreter uses this to route child workflow executions to
+            the correct execution pool internally. No runtime-vendor concepts
+            are ever referenced in workflow YAML definitions.
+          example: "account-prepare"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Response envelopes
+    # ──────────────────────────────────────────────────────────────────────────
+
+    Meta:
+      type: object
+      properties:
+        requestId: { type: string }
+        timestamp: { type: string, format: date-time }
+        apiVersion: { type: string, example: "1.0" }
+
+    PaginationMeta:
+      type: object
+      description: Pagination metadata using the FinOS zero-based offset pattern.
+      properties:
+        pageSize: { type: integer }
+        pageStartIndex: { type: integer }
+        totalCount: { type: integer }
+        hasNext: { type: boolean }
+        hasPrev: { type: boolean }
+
+    FinOSWorkflowResponse:
+      type: object
+      properties:
+        data: { $ref: '#/components/schemas/FinOSWorkflow' }
+        meta: { $ref: '#/components/schemas/Meta' }
+
+    FinOSWorkflowListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/FinOSWorkflow' }
+        meta:
+          allOf:
+            - $ref: '#/components/schemas/Meta'
+            - type: object
+              properties:
+                pagination: { $ref: '#/components/schemas/PaginationMeta' }
+
+    NodeResponse:
+      type: object
+      properties:
+        data: { $ref: '#/components/schemas/FinOSWorkflowNode' }
+        meta: { $ref: '#/components/schemas/Meta' }
+
+    NodeListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/FinOSWorkflowNode' }
+        meta:
+          allOf:
+            - $ref: '#/components/schemas/Meta'
+            - type: object
+              properties:
+                pagination: { $ref: '#/components/schemas/PaginationMeta' }
+
+    EdgeResponse:
+      type: object
+      properties:
+        data: { $ref: '#/components/schemas/FinOSWorkflowEdge' }
+        meta: { $ref: '#/components/schemas/Meta' }
+
+    EdgeListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/FinOSWorkflowEdge' }
+        meta:
+          allOf:
+            - $ref: '#/components/schemas/Meta'
+            - type: object
+              properties:
+                pagination: { $ref: '#/components/schemas/PaginationMeta' }
+
+    ProblemDetails:
+      description: RFC 7807 Problem Details
+      type: object
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        traceId: { type: string }
+        timestamp: { type: string, format: date-time }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              code: { type: string }
+              message: { type: string }
+
+  responses:
+    BadRequest:
+      description: "400 — Malformed request body or invalid query parameters"
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+    Unauthorized:
+      description: "401 — Missing or invalid credentials"
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+    Forbidden:
+      description: "403 — Authenticated but not authorised for this resource"
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+    NotFound:
+      description: "404 — Resource not found"
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+    Conflict:
+      description: "409 — Conflict (duplicate ID, DAG cycle, invalid status transition)"
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+    ValidationError:
+      description: "422 — Schema validation failed"
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }

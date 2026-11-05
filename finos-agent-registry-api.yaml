@@ -1,0 +1,1163 @@
+openapi: 3.1.0
+
+# =============================================================================
+# FinOS Agent Registry API
+# Version:    1.0.0
+# Platform:   Blackline FinOS Orchestration Platform
+# 
+# Schema ref: finos-agent-card-schema.yaml
+#
+# Supports registration, discovery, and lifecycle management of FinOSAgents.
+# Agents are stored as FinOSAgentCard documents (A2A-native discovery schema).
+# A2A Tier A validation is enforced on every registration and card update.
+# =============================================================================
+
+info:
+  title: FinOS Agent Registry API
+  version: 1.0.0
+  description: |
+    **Agent Registry** service for the Blackline FinOS Orchestration Platform.
+
+    Provides the authoritative store for registered FinOSAgents. Each agent
+    is stored as a [FinOSAgentCard](./finos-agent-card-schema.yaml) — the
+    A2A-native discovery document — alongside registry-managed metadata
+    (status, trust tier, role, tenant).
+
+    ## Registration Flow
+
+    ```
+    Caller                Agent Registry               Agent Registry DB
+      │                        │                           │
+      │  POST /agents          │                           │
+      │  { agentCard, role,    │                           │
+      │    trustTier }         │                           │
+      │──────────────────────▶ │                           │
+      │                        │  A2A Tier A validation    │
+      │                        │  (schema + extension      │
+      │                        │   + skills + interfaces)  │
+      │                        │                           │
+      │                        │  INSERT registration ────▶│
+      │                        │                           │
+      │  201 { agentId, ... }  │                           │
+      │◀────────────────────── │                           │
+    ```
+
+    ## A2A Tier A Validation (POST and card updates via PUT)
+
+    All agent registrations must pass A2A Tier A validation:
+
+    | Check | Rule |
+    |---|---|
+    | Schema | All required `FinOSAgentCard` fields present |
+    | FinOS Extension | `capabilities.extensions[]` contains entry with `uri: "https://{vendor-domain}/finos/agent-card/v1"` and `required: true` |
+    | Extension Params | `finOSAgentId`, `finOSAgentType`, `finOSLlmModel` present in extension `params` |
+    | Skills | `skills[]` non-empty |
+    | Interfaces | `supportedInterfaces[]` contains ≥1 entry with a reachable URL |
+    | Security | `securitySchemes` and `securityRequirements` non-empty |
+    | Uniqueness | No active agent with the same `agentId` exists in the tenant |
+
+    ## Trust Tiers
+
+    | Tier | Label | Description |
+    |---|---|---|
+    | `T0` | Platform Native | platform-managed infrastructure; full trust; all data access |
+    | `T1` | Certified Partner | BL runtime + SDK; high trust; sensitive data with HITL |
+    | `T2` | Registered External | Own infra + MCP; medium trust; filtered data only |
+    | `T3` | Provisional | Unvetted; restricted to public data; HITL required for all writes |
+
+    ## Filter Syntax
+
+    The `filter` query parameter uses the FinOS standard expression syntax:
+
+    ```
+    field operator "value"
+    field1 operator "val1" and field2 operator "val2"
+    ```
+
+    Supported operators: `contains` (case-insensitive substring), `eq` (exact equality)
+
+    Examples:
+    ```
+    filter=name contains "match"
+    filter=status eq "active"
+    filter=provider eq "Example Corp" and role eq "operational"
+    filter=name contains "match" and status eq "active"
+    ```
+
+    ## Base URL
+    `https://api.example.com/finos/v1`
+
+    ## Namespace Placeholders
+
+    Examples in this document use `{vendor-domain}`, `{event-namespace}`,
+    `{source-root}` and `{api-host}` where a wire identifier must live in a
+    namespace the implementation controls. Substitute all four consistently at
+    deployment time; the structure after the namespace root is normative. See
+    README §3.4.
+  contact:
+    name: Blackline Platform Engineering
+    email: platform-eng@blackline.com
+    url: https://developer.blackline.com/finos
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+servers:
+  - url: https://api.example.com/finos/v1
+    description: Production
+  - url: https://api-sandbox.example.com/finos/v1
+    description: Sandbox / Development
+
+security:
+  - BearerAuth: []
+  - ApiKeyAuth: []
+
+tags:
+  - name: Health
+    description: Liveness and dependency connectivity checks
+  - name: Registry
+    description: Agent registration, discovery, and lifecycle management
+
+# =============================================================================
+# PATHS
+# =============================================================================
+paths:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Health
+  # ─────────────────────────────────────────────────────────────────────────
+
+  /health:
+    get:
+      operationId: getHealth
+      summary: Liveness and DB connectivity check
+      description: |
+        Returns the liveness status of the Agent Registry service and its
+        connectivity to Agent Registry DB.
+
+        Designed for use by Kubernetes liveness and readiness probes, load
+        balancer health checks, and external monitoring systems.
+
+        A `200` response with `status: "ok"` means all checks passed.
+        A `200` response with `status: "degraded"` means the service is alive
+        but one or more dependency checks are failing (e.g. elevated DB
+        latency). The service should still be routed to.
+        A `503` response means the service or a critical dependency is down.
+      tags: [Health]
+      security: []
+      responses:
+        "200":
+          description: Service is live (ok or degraded)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthResponse' }
+              examples:
+                healthy:
+                  summary: All checks passing
+                  value:
+                    status: ok
+                    version: "1.0.0"
+                    timestamp: "2026-05-18T09:00:00Z"
+                    checks:
+                      liveness:
+                        status: pass
+                        latencyMs: 1
+                      db:
+                        status: pass
+                        latencyMs: 4
+                        instance: "projects/acme-prod/instances/finos-registry"
+                        database: "agent-registry"
+                degraded:
+                  summary: DB latency elevated
+                  value:
+                    status: degraded
+                    version: "1.0.0"
+                    timestamp: "2026-05-18T09:00:00Z"
+                    checks:
+                      liveness:
+                        status: pass
+                        latencyMs: 1
+                      db:
+                        status: fail
+                        latencyMs: 4200
+                        instance: "projects/acme-prod/instances/finos-registry"
+                        database: "agent-registry"
+                        errorMessage: "Deadline exceeded after 4200ms"
+        "503":
+          description: Service or critical dependency unavailable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthResponse' }
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Agent Collection
+  # ─────────────────────────────────────────────────────────────────────────
+
+  /agent-registry/agents:
+    get:
+      operationId: listAgents
+      summary: List registered agents
+      description: |
+        Returns all non-revoked agents matching the filter expression,
+        ordered by the specified sort field.
+
+        **Caching:** Responses are cached at the registry CDN layer.
+        Cache is invalidated on every write (POST, PUT, DELETE).
+        Add `Cache-Control: no-cache` to bypass the cache.
+
+        **Filter syntax:**
+        ```
+        filter=field operator "value"
+        filter=field1 op "val1" and field2 op "val2"
+        ```
+
+        Supported operators: `contains` (case-insensitive substring match),
+        `eq` (exact equality).
+
+        Supported filter fields:
+
+        | Field | Behavior | Example |
+        |---|---|---|
+        | `name` | Agent name | `name contains "match"` |
+        | `provider` | Provider organization | `provider eq "Example Corp"` |
+        | `version` | Semantic version | `version eq "2.1.0"` |
+        | `role` | Agent role category | `role eq "operational"` |
+        | `status` | Lifecycle status | `status eq "active"` |
+
+        Agents with `status = revoked` are **always excluded** from list results.
+        To retrieve revoked agents, use `GET /agent-registry/agents/{agentId}` directly.
+      tags: [Registry]
+      parameters:
+        - $ref: '#/components/parameters/FilterParam'
+        - $ref: '#/components/parameters/SortParam'
+        - $ref: '#/components/parameters/SortOrderParam'
+        - $ref: '#/components/parameters/PageSizeParam'
+        - $ref: '#/components/parameters/PageStartIndexParam'
+      responses:
+        "200":
+          description: Paginated list of agent registrations
+          headers:
+            X-Cache:
+              description: HIT if served from cache, MISS if freshly computed
+              schema: { type: string, enum: [HIT, MISS] }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AgentListResponse' }
+              example:
+                data:
+                  - agentId: "7f3d8c1a-0000-0000-0000-000000000001"
+                    name: "TxnMatchAgent"
+                    provider: "Example Corp"
+                    version: "2.1.0"
+                    role: "operational"
+                    status: "active"
+                    trustTier: "T0"
+                    agentType: "EXECUTOR"
+                    llmModel: "claude-sonnet-4-6"
+                    tenantId: "tenant-acme-prod"
+                    a2aEndpoint: "https://agents.example.com/txn-match/message:send"
+                    wellKnownUrl: "https://agents.example.com/txn-match/.well-known/agent-card.json"
+                    createdAt: "2026-01-15T08:00:00Z"
+                    updatedAt: "2026-04-10T14:30:00Z"
+                meta:
+                  requestId: "req-abc123"
+                  timestamp: "2026-05-18T09:00:00Z"
+                  apiVersion: "1.0"
+                  pagination:
+                    pageSize: 20
+                    pageStartIndex: 0
+                    totalCount: 1
+                    hasNext: false
+                    hasPrev: false
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+
+    post:
+      operationId: registerAgent
+      summary: Register a new FinOSAgent
+      description: |
+        Registers a new FinOSAgent by storing its `FinOSAgentCard` alongside
+        registry-managed metadata.
+
+        **A2A Tier A validation** is applied before the agent is persisted.
+        All seven checks must pass (see API description above). Failures return
+        `422` with a structured `A2AValidationError` listing each failing check.
+
+        **Idempotency:** Provide an `Idempotency-Key` header to safely retry
+        on network failure. Resubmitting the same key within 24 hours returns
+        the original `201` response without creating a duplicate.
+
+        **Conflict:** If an active agent with the same `agentId` (sourced from
+        `agentCard.capabilities.extensions[].params.finOSAgentId`) already exists
+        in the tenant, a `409` is returned.
+
+        **agentId resolution:**
+        1. If `agentId` is provided in the request body, it is used.
+        2. Else, `agentCard.capabilities.extensions[].params.finOSAgentId` is used.
+        3. Else, the registry generates a new UUID.
+        In all cases, `agentId` in the request body must match `finOSAgentId` in
+        the card extension params (if both are present).
+      tags: [Registry]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          description: Unique key for safe retries. Duplicate submissions within 24 h return the original response.
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FinOSAgentRegistrationRequest' }
+            example:
+              agentId: "7f3d8c1a-0000-0000-0000-000000000001"
+              role: "operational"
+              trustTier: "T0"
+              tenantId: "tenant-acme-prod"
+              registeredBy: "platform-eng@example.com"
+              agentCard:
+                name: "TxnMatchAgent"
+                description: "Example Transaction Matching Agent."
+                version: "2.1.0"
+                provider:
+                  organization: "Example Corp"
+                  url: "https://www.blackline.com"
+                supportedInterfaces:
+                  - url: "https://agents.example.com/txn-match/message:send"
+                    protocolBinding: "HTTP+JSON"
+                    protocolVersion: "1.0"
+                capabilities:
+                  streaming: false
+                  pushNotifications: false
+                  stateTransitionHistory: true
+                  extensions:
+                    - uri: "https://{vendor-domain}/finos/agent-card/v1"
+                      required: true
+                      description: "FinOS agent governance extension"
+                      params:
+                        finOSAgentId: "7f3d8c1a-0000-0000-0000-000000000001"
+                        finOSAgentType: "EXECUTOR"
+                        finOSLlmModel: "claude-sonnet-4-6"
+                        finOSSupportedContextModes: ["RAG_QUERY", "STRUCTURED_CHUNKS"]
+                        finOSPoliciesRequired: ["DATA_GOVERNANCE", "COMPLIANCE"]
+                        finOSTenantId: "tenant-acme-prod"
+                securitySchemes:
+                  bearerAuth:
+                    type: http
+                    scheme: bearer
+                    bearerFormat: JWT
+                securityRequirements:
+                  - bearerAuth: ["finos:agent:invoke"]
+                defaultInputModes: ["text", "data"]
+                defaultOutputModes: ["data"]
+                skills:
+                  - id: "transaction-matching"
+                    name: "Transaction Matching"
+                    description: "Matches transactions against accounting records to identify and resolve discrepancies."
+                    tags: ["transaction", "matching", "reconciliation"]
+                    inputModes: ["data", "file"]
+                    outputModes: ["data"]
+      responses:
+        "201":
+          description: Agent registered
+          headers:
+            Location:
+              description: URL of the registered agent
+              schema:
+                type: string
+                example: "https://{api-host}/finos/v1/agent-registry/agents/7f3d8c1a-0000-0000-0000-000000000001"
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AgentResponse' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "409": { $ref: '#/components/responses/Conflict' }
+        "422":
+          description: |
+            A2A Tier A validation failed or schema validation error.
+            The response body is an `A2AValidationError` with a structured
+            list of failing checks and field-level errors.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/A2AValidationError' }
+              example:
+                type: "https://{api-host}/finos/errors/a2a-validation-failed"
+                title: "A2A Tier A Validation Failed"
+                status: 422
+                detail: "2 validation check(s) failed."
+                traceId: "0af7651916cd43dd8448eb211c80319c"
+                timestamp: "2026-05-18T09:00:00Z"
+                validationChecks:
+                  - check: "FinOS Extension"
+                    passed: false
+                    message: "capabilities.extensions[] must contain an entry with uri='https://{vendor-domain}/finos/agent-card/v1' and required=true."
+                  - check: "Extension Params"
+                    passed: false
+                    message: "finOSAgentType is required in extension params."
+                fieldErrors:
+                  - field: "agentCard.capabilities.extensions"
+                    code: "missing-finos-extension"
+                    message: "FinOS extension entry not found."
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Agent Resource
+  # ─────────────────────────────────────────────────────────────────────────
+
+  /agent-registry/agents/{agentId}:
+    parameters:
+      - $ref: '#/components/parameters/AgentIdPath'
+
+    get:
+      operationId: getAgent
+      summary: Get a single agent by ID
+      description: |
+        Retrieves the full registration record for a single agent by its UUID.
+        Returns the complete `FinOSAgentCard` document alongside all registry metadata.
+
+        Unlike the list endpoint, revoked agents **are** returned by this endpoint.
+        Callers should check `status` to determine whether the agent is invocable.
+      tags: [Registry]
+      responses:
+        "200":
+          description: Agent registration record
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AgentResponse' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+
+    put:
+      operationId: updateAgent
+      summary: Partial update — metadata or status
+      description: |
+        Applies a partial update to a registered agent. Only fields present in
+        the request body are modified; absent fields retain their current values.
+
+        **Updatable fields:**
+
+        | Field | Notes |
+        |---|---|
+        | `status` | Lifecycle transition. Allowed: `active ↔ inactive`, `active → suspended`. `revoked` is terminal — cannot be set via this endpoint; use DELETE. |
+        | `trustTier` | Re-classification of trust tier requires elevated permissions. |
+        | `role` | Role reclassification. |
+        | `agentCard` | Full replacement of the stored card. A2A Tier A validation is re-applied. |
+        | `registrationMetadata` | Free-form metadata map. Merged with existing metadata (keys are overwritten; unmentioned keys retained). |
+
+        **Immutable fields:** `agentId`, `tenantId`, `createdAt`, `registeredBy`.
+
+        **Revoked agents** cannot be updated. Returns `409`.
+      tags: [Registry]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FinOSAgentUpdateRequest' }
+            examples:
+              suspend_agent:
+                summary: Suspend an agent (block invocations)
+                value:
+                  status: "suspended"
+              reactivate_agent:
+                summary: Reactivate an inactive agent
+                value:
+                  status: "active"
+              elevate_trust:
+                summary: Elevate trust tier after certification
+                value:
+                  trustTier: "T1"
+              update_card_version:
+                summary: Update agent card to a new version
+                value:
+                  agentCard:
+                    name: "TxnMatchAgent"
+                    version: "2.2.0"
+                    description: "Updated to support multi-currency transaction matching."
+      responses:
+        "200":
+          description: Agent updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AgentResponse' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "409": { $ref: '#/components/responses/Conflict' }
+        "422":
+          description: A2A Tier A validation failed (when agentCard is updated)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/A2AValidationError' }
+
+    delete:
+      operationId: deregisterAgent
+      summary: Deregister (soft delete) an agent
+      description: |
+        Soft-deletes the agent by setting its `status` to `inactive`.
+        The agent record is retained for audit purposes.
+
+        **Effect:**
+        - The agent no longer appears in `GET /agent-registry/agents` list results.
+        - The agent can still be retrieved individually via `GET /agent-registry/agents/{agentId}`.
+        - Existing in-flight workflow executions using this agent are **not** interrupted.
+        - The agent can be reactivated via `PUT /agent-registry/agents/{agentId}` with `{ "status": "active" }`.
+
+        To permanently decommission an agent (set to `revoked`), use `PUT` with
+        `{ "status": "revoked" }`. Revoked agents cannot be reactivated.
+
+        Returns `404` if the agent does not exist.
+        Returns `409` if the agent is already `inactive` or `revoked`.
+      tags: [Registry]
+      responses:
+        "204": { description: Agent deregistered (status set to inactive) }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "409": { $ref: '#/components/responses/Conflict' }
+
+# =============================================================================
+# COMPONENTS
+# =============================================================================
+components:
+
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: OAuth 2.0 / OIDC JWT issued by the platform identity provider.
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-FinOS-API-Key
+      description: Service-to-service machine client API key.
+
+  # ── Parameters ─────────────────────────────────────────────────────────────
+
+  parameters:
+
+    AgentIdPath:
+      name: agentId
+      in: path
+      required: true
+      description: Unique UUID of the registered agent.
+      schema:
+        type: string
+        format: uuid
+        example: "7f3d8c1a-0000-0000-0000-000000000001"
+
+    FilterParam:
+      name: filter
+      in: query
+      required: false
+      description: |
+        FinOS standard filter expression.
+        Syntax: `field operator "value"` optionally joined by `and`.
+        Operators: `contains` (case-insensitive substring), `eq` (exact equality).
+        Supported fields: `name`, `provider`, `version`, `role`, `status`.
+      schema:
+        type: string
+      examples:
+        name_contains:
+          value: 'name contains "match"'
+        status_eq:
+          value: 'status eq "active"'
+        compound:
+          value: 'provider eq "Example Corp" and role eq "operational"'
+
+    SortParam:
+      name: sort
+      in: query
+      required: false
+      description: Field to sort by.
+      schema:
+        type: string
+        enum: [name, provider, version, role, createdAt]
+        default: name
+      example: createdAt
+
+    SortOrderParam:
+      name: sortOrder
+      in: query
+      required: false
+      description: Sort direction.
+      schema:
+        type: string
+        enum: [asc, desc]
+        default: asc
+
+    PageSizeParam:
+      name: pageSize
+      in: query
+      required: false
+      description: Number of results per page (1–100).
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+      example: 20
+
+    PageStartIndexParam:
+      name: pageStartIndex
+      in: query
+      required: false
+      description: Zero-based start index for pagination.
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+      example: 0
+
+  # ── Responses ──────────────────────────────────────────────────────────────
+
+  responses:
+
+    NotFound:
+      description: "404 — Agent not found"
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+          example:
+            type: "https://{api-host}/finos/errors/not-found"
+            title: "Agent Not Found"
+            status: 404
+            detail: "No agent with ID '7f3d8c1a-0000-0000-0000-000000000001' exists."
+            traceId: "0af7651916cd43dd8448eb211c80319c"
+            timestamp: "2026-05-18T09:00:00Z"
+
+    BadRequest:
+      description: "400 — Malformed request body or invalid query parameters"
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+
+    Unauthorized:
+      description: "401 — Missing or invalid authentication credentials"
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+
+    Conflict:
+      description: "409 — Conflict (duplicate agentId, invalid status transition, revoked agent)"
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+          example:
+            type: "https://{api-host}/finos/errors/conflict"
+            title: "Agent Already Registered"
+            status: 409
+            detail: "An active agent with ID '7f3d8c1a-...' already exists in tenant 'tenant-acme-prod'."
+            traceId: "0af7651916cd43dd8448eb211c80319c"
+            timestamp: "2026-05-18T09:00:00Z"
+
+  # ── Schemas ────────────────────────────────────────────────────────────────
+
+  schemas:
+
+    # ── Enumerations ───────────────────────────────────────────────────────
+
+    AgentRole:
+      type: string
+      enum: [operational, monitoring]
+      description: |
+        High-level role category for filtering and routing.
+        Maps to `FinOSAgentExtensionParams.finOSAgentType` in the agent card:
+        - `operational` — agents that perform work: EXECUTOR, CLASSIFIER, EXTRACTOR, SUMMARIZER, PLANNER, CUSTOM
+        - `monitoring` — agents that observe, audit, or validate: MONITOR, REVIEWER, ORCHESTRATOR
+
+    AgentLifecycleStatus:
+      type: string
+      enum: [active, inactive, suspended, revoked]
+      description: |
+        Agent lifecycle status managed by the registry.
+        - `active` — registered, discoverable, and invocable
+        - `inactive` — soft-deleted via DELETE; not discoverable; can be reactivated
+        - `suspended` — temporarily blocked (e.g. policy violation, security hold); not invocable
+        - `revoked` — permanently decommissioned; terminal; cannot be reactivated
+
+    TrustTier:
+      type: string
+      enum: [T0, T1, T2, T3]
+      description: |
+        FinOS trust tier assigned at registration. Controls data access,
+        write permissions, HITL requirements, and allowed policy types.
+        - `T0` Platform Native — platform-managed infrastructure; full trust
+        - `T1` Certified Partner — BL runtime + SDK; high trust; sensitive data with HITL
+        - `T2` Registered External — own infrastructure + MCP; medium trust; filtered data only
+        - `T3` Provisional — unvetted; restricted to public data; HITL on all writes
+
+    FinOSAgentType:
+      type: string
+      enum: [ORCHESTRATOR, PLANNER, EXECUTOR, REVIEWER, MONITOR, EXTRACTOR, CLASSIFIER, SUMMARIZER, CUSTOM]
+      description: Granular agent role from FinOSAgentExtensionParams.finOSAgentType.
+
+    # ── Core registration resource ─────────────────────────────────────────
+
+    FinOSAgentRegistration:
+      type: object
+      description: |
+        The full agent registration record as stored in the Agent Registry.
+        Combines registry-managed fields (status, trustTier, role, timestamps)
+        with the agent's FinOSAgentCard document.
+      required:
+        - agentId
+        - name
+        - provider
+        - version
+        - role
+        - status
+        - trustTier
+        - agentCard
+        - createdAt
+        - updatedAt
+      properties:
+        agentId:
+          type: string
+          format: uuid
+          description: |
+            Globally unique agent ID. Sourced from
+            `agentCard.capabilities.extensions[finOSExt].params.finOSAgentId`
+            or server-generated if absent.
+          readOnly: true
+        name:
+          type: string
+          description: Agent display name, denormalized from `agentCard.name`.
+        provider:
+          type: string
+          description: Provider organization name, denormalized from `agentCard.provider.organization`.
+        version:
+          type: string
+          description: Semantic version, denormalized from `agentCard.version`.
+        role:
+          $ref: '#/components/schemas/AgentRole'
+        status:
+          $ref: '#/components/schemas/AgentLifecycleStatus'
+        trustTier:
+          $ref: '#/components/schemas/TrustTier'
+        agentType:
+          oneOf:
+            - $ref: '#/components/schemas/FinOSAgentType'
+            - type: "null"
+          description: |
+            Granular agent type denormalized from
+            `agentCard.capabilities.extensions[finOSExt].params.finOSAgentType`.
+        llmModel:
+          type: [string, "null"]
+          description: |
+            LLM powering the agent, denormalized from
+            `agentCard.capabilities.extensions[finOSExt].params.finOSLlmModel`.
+          example: "claude-sonnet-4-6"
+        supportedContextModes:
+          type: [array, "null"]
+          items:
+            type: string
+            enum: [RAG_QUERY, RAG_TENSOR, FINOSWORKFLOW_GRAPH, STRUCTURED_CHUNKS]
+          description: |
+            Context graph modes this agent supports, denormalized from
+            `finOSSupportedContextModes` in the extension params.
+        tenantId:
+          type: string
+          description: Tenant this agent is registered in.
+        a2aEndpoint:
+          type: string
+          format: uri
+          description: |
+            Primary A2A message delivery endpoint (`POST /message:send`).
+            Denormalized from `agentCard.supportedInterfaces[0].url`.
+        wellKnownUrl:
+          type: [string, "null"]
+          format: uri
+          description: A2A agent card discovery URL (`/.well-known/agent-card.json`).
+        agentCard:
+          $ref: '#/components/schemas/FinOSAgentCardDocument'
+        registeredBy:
+          type: string
+          description: Identity (userId or serviceId) that registered this agent.
+        registrationMetadata:
+          type: [object, "null"]
+          additionalProperties: true
+          description: Free-form key-value metadata supplied at registration time.
+        lastHeartbeatAt:
+          type: [string, "null"]
+          format: date-time
+          description: Timestamp of the last heartbeat/ping from the agent's endpoint.
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+        updatedAt:
+          type: string
+          format: date-time
+          readOnly: true
+
+    # ── Request schemas ────────────────────────────────────────────────────
+
+    FinOSAgentRegistrationRequest:
+      type: object
+      required:
+        - agentCard
+        - role
+        - trustTier
+      description: Request body for registering a new FinOSAgent.
+      properties:
+        agentId:
+          type: [string, "null"]
+          format: uuid
+          description: |
+            Optional client-supplied agent ID.
+            If provided, must match `agentCard.capabilities.extensions[finOSExt].params.finOSAgentId`
+            when that field is present.
+            If omitted, sourced from the extension params or server-generated.
+        agentCard:
+          $ref: '#/components/schemas/FinOSAgentCardDocument'
+          description: |
+            Full FinOSAgentCard document. A2A Tier A validation is applied.
+            Must include the FinOS extension with `required: true`.
+        role:
+          $ref: '#/components/schemas/AgentRole'
+        trustTier:
+          $ref: '#/components/schemas/TrustTier'
+        tenantId:
+          type: [string, "null"]
+          description: Tenant to register the agent in. Defaults to the caller's tenant.
+        registeredBy:
+          type: [string, "null"]
+          description: Identity registering the agent (userId, serviceId, or email).
+        registrationMetadata:
+          type: [object, "null"]
+          additionalProperties: true
+          description: Optional free-form metadata to store alongside the registration.
+
+    FinOSAgentUpdateRequest:
+      type: object
+      description: |
+        Partial update request for an existing agent registration.
+        Only fields present in the request body are modified.
+      properties:
+        status:
+          oneOf:
+            - $ref: '#/components/schemas/AgentLifecycleStatus'
+            - type: "null"
+          description: |
+            Status transition. Valid transitions:
+            - `active → inactive` (soft deregister)
+            - `active → suspended` (security hold)
+            - `inactive → active` (reactivate)
+            - `suspended → active` (lift hold)
+            - `active | inactive | suspended → revoked` (permanent decommission)
+            Setting `revoked` directly via PUT is the controlled path to permanent decommission.
+        trustTier:
+          oneOf:
+            - $ref: '#/components/schemas/TrustTier'
+            - type: "null"
+          description: Re-classify the agent's trust tier. Requires elevated permissions.
+        role:
+          oneOf:
+            - $ref: '#/components/schemas/AgentRole'
+            - type: "null"
+        agentCard:
+          oneOf:
+            - $ref: '#/components/schemas/FinOSAgentCardDocument'
+            - type: "null"
+          description: |
+            If provided, replaces the entire stored FinOSAgentCard.
+            A2A Tier A validation is re-applied in full.
+        registrationMetadata:
+          type: [object, "null"]
+          additionalProperties: true
+          description: |
+            Metadata keys are merged with existing values.
+            Set a key to `null` to remove it.
+
+    # ── FinOSAgentCard (condensed; full schema: finos-agent-card-schema.yaml) ─
+
+    FinOSAgentCardDocument:
+      type: object
+      description: |
+        A2A-compatible FinOSAgentCard discovery document.
+        Full schema reference: `finos-agent-card-schema.yaml#/components/schemas/FinOSAgentCard`.
+
+        **A2A Tier A validation rules (enforced on POST and on card updates):**
+        1. All required A2A fields must be present: `name`, `description`, `version`,
+           `skills`, `supportedInterfaces`, `capabilities`, `defaultInputModes`, `defaultOutputModes`.
+        2. `capabilities.extensions[]` must include an entry with:
+           - `uri: "https://{vendor-domain}/finos/agent-card/v1"`
+           - `required: true`
+        3. That entry's `params` must include `finOSAgentId`, `finOSAgentType`, `finOSLlmModel`.
+        4. `skills[]` must be non-empty.
+        5. `supportedInterfaces[]` must have at least one entry with a reachable `url`.
+        6. `securitySchemes` and `securityRequirements` must be non-empty.
+      required:
+        - name
+        - description
+        - version
+        - skills
+        - supportedInterfaces
+        - capabilities
+        - defaultInputModes
+        - defaultOutputModes
+      properties:
+        name:
+          type: string
+          maxLength: 255
+          description: Human-readable agent name (A2A `name`).
+        description:
+          type: string
+          description: What this agent does (A2A `description`).
+        version:
+          type: string
+          description: Semantic version (A2A `version`).
+          example: "2.1.0"
+        documentationUrl:
+          type: [string, "null"]
+          format: uri
+        provider:
+          type: object
+          description: A2A `AgentProvider`.
+          properties:
+            organization: { type: string, example: "Example Corp" }
+            url: { type: string, format: uri }
+        supportedInterfaces:
+          type: array
+          minItems: 1
+          description: A2A protocol binding endpoints.
+          items:
+            type: object
+            required: [url, protocolBinding]
+            properties:
+              url: { type: string, format: uri }
+              protocolBinding:
+                type: string
+                enum: [JSONRPC, GRPC, "HTTP+JSON"]
+              protocolVersion: { type: string }
+              tenant: { type: string }
+        capabilities:
+          type: object
+          required: [extensions]
+          description: A2A capability flags and FinOS extension declarations.
+          properties:
+            streaming: { type: boolean, default: false }
+            pushNotifications: { type: boolean, default: false }
+            stateTransitionHistory: { type: boolean, default: true }
+            extensions:
+              type: array
+              description: |
+                Must include the FinOS extension entry.
+                Entry with `uri: "https://{vendor-domain}/finos/agent-card/v1"` and
+                `required: true` is mandatory for A2A Tier A validation.
+              items:
+                type: object
+                required: [uri]
+                properties:
+                  uri:
+                    type: string
+                    format: uri
+                    example: "https://{vendor-domain}/finos/agent-card/v1"
+                  required: { type: boolean, default: false }
+                  description: { type: string }
+                  params:
+                    type: object
+                    description: |
+                      For the FinOS extension, params must conform to
+                      `FinOSAgentExtensionParams` from the agent card schema:
+                      - `finOSAgentId` (uuid, required)
+                      - `finOSAgentType` (enum, required)
+                      - `finOSLlmModel` (string, required)
+                      - `finOSSupportedContextModes` (array, optional)
+                      - `finOSPoliciesRequired` (array, optional)
+                      - `finOSTenantId` (string, optional)
+                    additionalProperties: true
+        securitySchemes:
+          type: object
+          description: A2A security scheme definitions (non-empty required).
+          additionalProperties:
+            type: object
+            additionalProperties: true
+        securityRequirements:
+          type: array
+          description: A2A security requirements (non-empty required).
+          items:
+            type: object
+            additionalProperties:
+              type: array
+              items: { type: string }
+        defaultInputModes:
+          type: array
+          items: { type: string, enum: [text, data, file] }
+          example: [text, data]
+        defaultOutputModes:
+          type: array
+          items: { type: string, enum: [text, data, file, stream] }
+          example: [data]
+        skills:
+          type: array
+          minItems: 1
+          description: What this agent can do (non-empty required).
+          items:
+            type: object
+            required: [id, name]
+            properties:
+              id: { type: string }
+              name: { type: string }
+              description: { type: string }
+              tags: { type: array, items: { type: string } }
+              examples: { type: array, items: { type: string } }
+              inputModes: { type: array, items: { type: string } }
+              outputModes: { type: array, items: { type: string } }
+
+    # ── Health ─────────────────────────────────────────────────────────────
+
+    HealthResponse:
+      type: object
+      required: [status, checks, timestamp]
+      description: Response body for GET /health.
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded, unhealthy]
+          description: Overall health status.
+        version:
+          type: string
+          description: Service version.
+          example: "1.0.0"
+        timestamp:
+          type: string
+          format: date-time
+        checks:
+          type: object
+          description: Individual dependency check results.
+          properties:
+            liveness:
+              type: object
+              description: Service process liveness.
+              properties:
+                status: { type: string, enum: [pass, fail] }
+                latencyMs: { type: integer, description: "Internal check latency in ms." }
+            db:
+              type: object
+              description: Agent Registry DB Connectivity Check.
+              properties:
+                status: { type: string, enum: [pass, fail] }
+                latencyMs: { type: integer, description: "DB round-trip latency in ms." }
+                instance:
+                  type: string
+                  description: DB instance resource name.
+                  example: "projects/acme-prod/instances/finos-registry"
+                database:
+                  type: string
+                  description: DB database name.
+                  example: "agent-registry"
+                errorMessage:
+                  type: [string, "null"]
+                  description: Error detail if status=fail.
+
+    # ── Response envelopes ─────────────────────────────────────────────────
+
+    Meta:
+      type: object
+      properties:
+        requestId: { type: string }
+        timestamp: { type: string, format: date-time }
+        apiVersion: { type: string, example: "1.0" }
+
+    PaginationMeta:
+      type: object
+      description: Pagination metadata using FinOS zero-based offset pattern.
+      properties:
+        pageSize:
+          type: integer
+          description: Number of results in this page.
+        pageStartIndex:
+          type: integer
+          description: Zero-based start index of this page.
+        totalCount:
+          type: integer
+          description: Total number of matching records.
+        hasNext:
+          type: boolean
+          description: Whether a next page exists.
+        hasPrev:
+          type: boolean
+          description: Whether a previous page exists.
+
+    AgentResponse:
+      type: object
+      description: Single-agent response envelope.
+      properties:
+        data: { $ref: '#/components/schemas/FinOSAgentRegistration' }
+        meta: { $ref: '#/components/schemas/Meta' }
+
+    AgentListResponse:
+      type: object
+      description: Paginated list response envelope.
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/FinOSAgentRegistration' }
+        meta:
+          allOf:
+            - $ref: '#/components/schemas/Meta'
+            - type: object
+              properties:
+                pagination: { $ref: '#/components/schemas/PaginationMeta' }
+
+    # ── Errors ─────────────────────────────────────────────────────────────
+
+    ProblemDetails:
+      type: object
+      description: RFC 7807 Problem Details.
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: [string, "null"] }
+        instance: { type: [string, "null"], format: uri-reference }
+        traceId: { type: [string, "null"] }
+        timestamp: { type: string, format: date-time }
+        errors:
+          type: [array, "null"]
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              code: { type: string }
+              message: { type: string }
+
+    A2AValidationError:
+      description: |
+        Problem Details extension for A2A Tier A validation failures (HTTP 422).
+        Includes the result of each individual validation check and field-level errors.
+      allOf:
+        - $ref: '#/components/schemas/ProblemDetails'
+        - type: object
+          properties:
+            validationChecks:
+              type: array
+              description: Result of each A2A Tier A check.
+              items:
+                type: object
+                required: [check, passed]
+                properties:
+                  check:
+                    type: string
+                    description: Name of the validation check.
+                    enum:
+                      - Schema
+                      - FinOS Extension
+                      - Extension Params
+                      - Skills
+                      - Interfaces
+                      - Security
+                      - Uniqueness
+                  passed: { type: boolean }
+                  message:
+                    type: [string, "null"]
+                    description: Failure reason (present only when passed=false).
+            fieldErrors:
+              type: [array, "null"]
+              description: Field-level schema validation errors.
+              items:
+                type: object
+                properties:
+                  field: { type: string }
+                  code: { type: string }
+                  message: { type: string }

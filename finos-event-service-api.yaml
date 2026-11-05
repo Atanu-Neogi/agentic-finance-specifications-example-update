@@ -1,0 +1,1713 @@
+openapi: 3.1.0
+
+# =============================================================================
+# FinOS Event Service API
+# Version:      1.0.0
+# Service:      event-service
+# Platform:     Blackline FinOS Orchestration Platform
+#
+# Schema alignment:
+#   finos-workflow-execution-history-openapi.yaml  → FinOSEventBase, FinOSEventType,
+#                                                     CloudEventBase, all subtypes,
+#                                                     supporting schemas
+#   finos-workflow-api.yaml                        → HITL callback patterns,
+#                                                     workflow/execution context
+# =============================================================================
+
+info:
+  title: FinOS Event Service API
+  version: 1.0.0
+  description: |
+    REST API for **publishing** and **subscribing** to `FinOSEvent` instances
+    on the Blackline FinOS Orchestration Platform.
+
+    ## FinOSEvent & CloudEvent Compliance
+
+    All FinOS events conform to the
+    [CloudEvents v1.0 specification](https://github.com/cloudevents/spec). The
+    required CloudEvent attributes (`id`, `source`, `specversion`, `type`) are
+    present on every event, with FinOS governance extensions added on top.
+
+    ## Event Subtypes
+
+    The `finOSEventType` field is the sub-type discriminator:
+
+    | Subtype | Description | Reverse-DNS type prefix |
+    |---|---|---|
+    | `FinOSAgentEvent` | LLM agent action — tool calls, skills, HITL tasks | `{event-namespace}.finos.agent.*` |
+    | `FinOSAPIEvent` | External REST API call and response | `{event-namespace}.finos.api.*` |
+    | `FinOSHITLEvent` | Human-in-the-loop task or decision | `{event-namespace}.finos.hitl.*` |
+    | `FinOSPolicyEvent` | FinOSPolicy evaluation and outcome | `{event-namespace}.finos.policy.*` |
+
+    ## Publishing Modes
+
+    | Mode | Endpoint | `workflowId` | `workflowInstanceId` |
+    |---|---|---|---|
+    | **Standalone** | `POST /event-service/v1/events` | optional | optional |
+    | **Workflow-contextualised** | `POST /event-service/v1/workflows/{workflowId}/executions/{executionId}/events` | required (path) | required (path) |
+
+    ## Subscription Scopes
+
+    Subscriptions register a `callbackUrl` to receive matching events via HTTP POST.
+
+    | Scope | Endpoint | Discriminating filter |
+    |---|---|---|
+    | **By event type** | `/event-service/v1/subscriptions/by-event-type` | One or more `FinOSEventType` values |
+    | **By workflow** | `/event-service/v1/subscriptions/by-workflow` | `workflowId` (any execution) |
+    | **By execution** | `/event-service/v1/subscriptions/by-execution` | `workflowId` + `workflowExecutionId` |
+
+    ## Event Delivery
+
+    Matching events are HTTP-POSTed to the subscriber's `callbackUrl`.
+    Requests carry an `X-FinOS-Signature` header (HMAC-SHA256 of the body using
+    the subscriber's `secret`) for verification.
+
+    ## Schema Alignment
+
+    `FinOSEventCore` (this spec) is structurally identical to `FinOSEventBase`
+    in `finos-workflow-execution-history-openapi.yaml`, with the following
+    intentional differences:
+
+    - `workflowInstanceId` is **optional** in standalone mode (required in the
+      execution history spec because all events there are already scoped to an instance)
+    - `workflowId` is a **new optional field** linking to the workflow definition
+    - `nodeId`, `sessionId`, `priority`, and `expiresAt` are new optional fields
+
+    ## Base URL
+    `https://api.example.com/event-service/v1`
+
+    ## Namespace Placeholders
+
+    Examples in this document use `{vendor-domain}`, `{event-namespace}`,
+    `{source-root}` and `{api-host}` where a wire identifier must live in a
+    namespace the implementation controls. Substitute all four consistently at
+    deployment time; the structure after the namespace root is normative. See
+    README §3.4.
+  contact:
+    name: Blackline Platform Engineering
+    email: platform-eng@blackline.com
+    url: https://developer.blackline.com/finos
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+servers:
+  - url: https://api.example.com/event-service/v1
+    description: Production
+  - url: https://api-sandbox.example.com/event-service/v1
+    description: Sandbox / Development
+
+security:
+  - BearerAuth: []
+  - ApiKeyAuth: []
+
+tags:
+  - name: Health
+    description: Liveness and dependency connectivity checks
+  - name: EventPublishing
+    description: Publish FinOSEvents — standalone and workflow-contextualised
+  - name: EventQuery
+    description: Retrieve and query published FinOSEvents
+  - name: SubscriptionsByEventType
+    description: Register/re-register subscriptions scoped to a FinOSEventType (use cases c & f-c)
+  - name: SubscriptionsByWorkflow
+    description: Register/re-register subscriptions scoped to a workflow ID (use cases d & f-d)
+  - name: SubscriptionsByExecution
+    description: Register/re-register subscriptions scoped to workflow + execution (use cases e & f-e)
+  - name: SubscriptionManagement
+    description: Read and cancel any subscription
+
+# =============================================================================
+# PATHS
+# =============================================================================
+paths:
+
+  # ── Health ──────────────────────────────────────────────────────────────────
+
+  /health:
+    get:
+      operationId: getHealth
+      summary: Liveness and datastore connectivity check
+      tags: [Health]
+      security: []
+      responses:
+        "200":
+          description: Service is live (ok or degraded)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthResponse' }
+        "503":
+          description: Critical dependency unavailable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthResponse' }
+
+  # ── Event Publishing — Standalone (use case a) ───────────────────────────────
+
+  /events:
+    post:
+      operationId: publishStandaloneEvent
+      summary: "Use case (a) — Push a standalone FinOSEvent to the platform"
+      description: |
+        Publishes a `FinOSEvent` to the FinOS platform as a **standalone event**
+        with no required workflow context. The event is routed to all active
+        subscriptions whose filter matches the event's `finOSEventType`, `tenantId`,
+        and any other filter predicates.
+
+        **`workflowInstanceId`** and **`workflowId`** are optional. When present they
+        associate the event with a running workflow execution for cross-service
+        traceability, but the event service does not validate their existence.
+
+        **Idempotency:** the `id` field (CloudEvent ID) is the natural idempotency
+        key. Re-posting an event with the same `id` and `source` within the
+        deduplication window returns `200` with the original event.
+      tags: [EventPublishing]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FinOSEvent' }
+            examples:
+              agent_event:
+                summary: Standalone FinOSAgentEvent
+                value:
+                  id: "evt-classify-001"
+                  source: "{source-root}/finos/agent/invoice-classifier"
+                  specversion: "1.0"
+                  type: "{event-namespace}.finos.agent.classify"
+                  time: "2026-05-18T09:00:10Z"
+                  subject: "invoice/INV-2026-00441"
+                  datacontenttype: "application/json"
+                  finOSEventType: "FinOSAgentEvent"
+                  tenantId: "tenant-acme-prod"
+                  correlationId: "corr-7890abcd-ef12-3456-7890-abcdef123456"
+                  llmModelName: "claude-sonnet-4-6"
+                  agent:
+                    agentId: "agt-00000001"
+                    agentName: "InvoiceClassifierAgent"
+                    agentType: "CLASSIFIER"
+                    agentVersion: "1.2.0"
+                  agentRun:
+                    runId: "run-aaaabbbb"
+                    runStatus: "COMPLETED"
+                    tokenUsage:
+                      inputTokens: 1240
+                      outputTokens: 340
+                      totalTokens: 1580
+      responses:
+        "201":
+          description: Event published
+          headers:
+            Location:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FinOSEventResponse' }
+        "200":
+          description: Duplicate event — returned from deduplication cache
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FinOSEventResponse' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "422": { $ref: '#/components/responses/ValidationError' }
+
+    get:
+      operationId: listEvents
+      summary: List and query published FinOSEvents
+      description: |
+        Returns a paginated list of published events matching the supplied
+        filter parameters. Useful for replay, debugging, and audit queries.
+      tags: [EventQuery]
+      parameters:
+        - name: finOSEventType
+          in: query
+          schema: { $ref: '#/components/schemas/FinOSEventType' }
+        - name: workflowId
+          in: query
+          schema: { type: string }
+        - name: workflowInstanceId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: tenantId
+          in: query
+          schema: { type: string }
+        - name: fromTime
+          in: query
+          schema: { type: string, format: date-time }
+        - name: toTime
+          in: query
+          schema: { type: string, format: date-time }
+        - $ref: '#/components/parameters/filterParam'
+        - $ref: '#/components/parameters/sortParam'
+        - $ref: '#/components/parameters/sortOrderParam'
+        - $ref: '#/components/parameters/pageSizeParam'
+        - $ref: '#/components/parameters/pageStartIndexParam'
+      responses:
+        "200":
+          description: Paginated event list
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FinOSEventListResponse' }
+
+  /events/{eventId}:
+    parameters:
+      - $ref: '#/components/parameters/eventIdPath'
+
+    get:
+      operationId: getEvent
+      summary: Retrieve a published event by ID
+      tags: [EventQuery]
+      responses:
+        "200":
+          description: Event record
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FinOSEventResponse' }
+        "404": { $ref: '#/components/responses/NotFound' }
+
+    put:
+      operationId: republishStandaloneEvent
+      summary: "Use case (f-a) — Re-publish a standalone FinOSEvent"
+      description: |
+        **Re-register / re-publish** for use case (a).
+
+        Replaces the stored event and re-dispatches it to all currently active
+        matching subscriptions. Use this to:
+        - Correct a previously published event with erroneous fields
+        - Trigger re-delivery after transient subscriber failures
+        - Replay an event for a newly registered subscription
+
+        The `id` in the path must match the `id` field in the request body.
+        `finOSEventType` and `source` are immutable after initial publish.
+      tags: [EventPublishing]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FinOSEvent' }
+      responses:
+        "200":
+          description: Event replaced and re-dispatched
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FinOSEventResponse' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "422": { $ref: '#/components/responses/ValidationError' }
+
+  # ── Event Publishing — Workflow Context (use case b) ─────────────────────────
+
+  /workflows/{workflowId}/executions/{executionId}/events:
+    parameters:
+      - $ref: '#/components/parameters/workflowIdPath'
+      - $ref: '#/components/parameters/executionIdPath'
+
+    post:
+      operationId: publishWorkflowEvent
+      summary: "Use case (b) — Push a FinOSEvent in the context of a running workflow"
+      description: |
+        Publishes a `FinOSEvent` scoped to a specific **workflow definition** and
+        **workflow execution instance**. The `workflowId` (path) and `executionId`
+        (path) are authoritative — they are injected into `workflowId` and
+        `workflowInstanceId` on the event regardless of values supplied in the body.
+
+        This is the primary publication method used by the **FinOS Workflows Engine**,
+        which emits one event per node transition. The engine performs this call
+        itself as part of executing the workflow — it is not a node an author
+        declares, and it does not appear in the workflow definition.
+
+        A conforming engine POSTs the following for each transition:
+
+        ```json
+        {
+          "id": "<instanceId>-<nodeId>-<nodeStatus>",
+          "source": "{source-root}/finos/agent/invoice-classifier",
+          "specversion": "1.0",
+          "type": "{event-namespace}.finos.agent.classify",
+          "time": "2026-05-18T09:00:10Z",
+          "finOSEventType": "FinOSAgentEvent",
+          "tenantId": "<tenantId>",
+          "nodeId": "<nodeId>",
+          "correlationId": "<instanceId>"
+        }
+        ```
+
+        See `5-finos-event-service-guide.md` §7 for the full emission contract and
+        the namespace placeholders.
+
+        Published events are automatically:
+        - Routed to subscriptions matching the workflow ID (use case d)
+        - Routed to subscriptions matching this specific execution (use case e)
+        - Routed to subscriptions matching the event type (use case c)
+      tags: [EventPublishing]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FinOSEvent' }
+            examples:
+              policy_event:
+                summary: Policy evaluation event in workflow context
+                value:
+                  id: "evt-policy-spending-001"
+                  source: "{source-root}/finos/policy/spending-limit"
+                  specversion: "1.0"
+                  type: "{event-namespace}.finos.policy.evaluate"
+                  time: "2026-05-18T09:00:12Z"
+                  finOSEventType: "FinOSPolicyEvent"
+                  tenantId: "tenant-acme-prod"
+                  correlationId: "corr-7890abcd"
+                  finOSPolicyId: "pol-spending-limit-v3"
+                  finOSPolicyEvaluationOutcome: "Escalate"
+                  targetEscalationRole: "finance-manager"
+                  evaluationInputs:
+                    invoiceAmount: 48500.00
+                    currency: "USD"
+                    vendorTier: "B"
+      responses:
+        "201":
+          description: Event published in workflow context
+          headers:
+            Location:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FinOSEventResponse' }
+        "200":
+          description: Duplicate — returned from deduplication cache
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FinOSEventResponse' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "422": { $ref: '#/components/responses/ValidationError' }
+
+    get:
+      operationId: listWorkflowExecutionEvents
+      summary: List all events published for a specific workflow execution
+      tags: [EventQuery]
+      parameters:
+        - name: finOSEventType
+          in: query
+          schema: { $ref: '#/components/schemas/FinOSEventType' }
+        - $ref: '#/components/parameters/filterParam'
+        - $ref: '#/components/parameters/sortParam'
+        - $ref: '#/components/parameters/sortOrderParam'
+        - $ref: '#/components/parameters/pageSizeParam'
+        - $ref: '#/components/parameters/pageStartIndexParam'
+      responses:
+        "200":
+          description: Paginated event list for this execution
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FinOSEventListResponse' }
+        "404": { $ref: '#/components/responses/NotFound' }
+
+  /workflows/{workflowId}/executions/{executionId}/events/{eventId}:
+    parameters:
+      - $ref: '#/components/parameters/workflowIdPath'
+      - $ref: '#/components/parameters/executionIdPath'
+      - $ref: '#/components/parameters/eventIdPath'
+
+    get:
+      operationId: getWorkflowEvent
+      summary: Get a single workflow-context event by ID
+      tags: [EventQuery]
+      responses:
+        "200":
+          description: Event record
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FinOSEventResponse' }
+        "404": { $ref: '#/components/responses/NotFound' }
+
+    put:
+      operationId: republishWorkflowEvent
+      summary: "Use case (f-b) — Re-publish a workflow-context FinOSEvent"
+      description: |
+        **Re-register / re-publish** for use case (b).
+
+        Replaces and re-dispatches a previously published workflow-context event.
+        The `workflowId` and `executionId` path params are enforced.
+        `finOSEventType` and `source` are immutable.
+      tags: [EventPublishing]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FinOSEvent' }
+      responses:
+        "200":
+          description: Event replaced and re-dispatched
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FinOSEventResponse' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "422": { $ref: '#/components/responses/ValidationError' }
+
+  # ── Subscriptions — By Event Type (use cases c & f-c) ────────────────────────
+
+  /subscriptions/by-event-type:
+    post:
+      operationId: registerSubscriptionByEventType
+      summary: "Use case (c) — Register to receive all events of given FinOSEventType(s)"
+      description: |
+        Registers a subscription to receive **all `FinOSEvent` instances** for one
+        or more `FinOSEventType` values across the caller's tenant, regardless of
+        which workflow or execution produced them.
+
+        **`callbackUrl` (required):** the HTTP endpoint to which matching events
+        are POSTed. Must be HTTPS in production. Must return `2xx` within
+        `deliveryConfig.timeoutMs` to acknowledge receipt.
+
+        **Signature verification:** if `deliveryConfig.secret` is set, each
+        delivery request carries an `X-FinOS-Signature: sha256={hmac}` header
+        computed as `HMAC-SHA256(requestBody, secret)`.
+      tags: [SubscriptionsByEventType]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SubscriptionByEventTypeCreate' }
+            example:
+              callbackUrl: "https://my-service.example.com/webhooks/finos"
+              filter:
+                eventTypes: ["FinOSAgentEvent", "FinOSPolicyEvent"]
+                sourcePattern: "{source-root}/finos/*"
+              deliveryConfig:
+                secret: "my-hmac-secret-32chars-minimum"
+                maxRetries: 3
+                timeoutMs: 5000
+              expiresAt: "2027-01-01T00:00:00Z"
+      responses:
+        "201":
+          description: Subscription registered
+          headers:
+            Location:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FinOSSubscriptionResponse' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "422": { $ref: '#/components/responses/ValidationError' }
+
+  /subscriptions/by-event-type/{subscriptionId}:
+    parameters:
+      - $ref: '#/components/parameters/subscriptionIdPath'
+
+    put:
+      operationId: reregisterSubscriptionByEventType
+      summary: "Use case (f-c) — Re-register (fully replace) a by-event-type subscription"
+      description: |
+        Fully replaces an existing by-event-type subscription. All fields — including
+        `callbackUrl`, `filter.eventTypes`, and `deliveryConfig` — are replaced with
+        the values in the request body.
+
+        Common uses:
+        - Rotate the HMAC `secret` without service interruption
+        - Change the `callbackUrl` after a service migration
+        - Add or remove `eventTypes` from the filter
+        - Extend the `expiresAt` window
+
+        Re-registration is atomic: in-flight deliveries for the old subscription
+        complete against the old configuration before the new one takes effect.
+      tags: [SubscriptionsByEventType]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SubscriptionByEventTypeCreate' }
+      responses:
+        "200":
+          description: Subscription replaced
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FinOSSubscriptionResponse' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "422": { $ref: '#/components/responses/ValidationError' }
+
+  # ── Subscriptions — By Workflow ID (use cases d & f-d) ───────────────────────
+
+  /subscriptions/by-workflow:
+    post:
+      operationId: registerSubscriptionByWorkflow
+      summary: "Use case (d) — Register to receive FinOS events for a given workflow ID"
+      description: |
+        Registers a subscription to receive all `FinOSEvent` instances emitted
+        by **any execution** of the specified workflow definition (`workflowId`).
+
+        Events from all execution instances of the workflow are delivered, regardless
+        of `finOSEventType` unless an optional `eventTypes` filter is also specified.
+
+        The `callbackUrl` receives events as HTTP POST with HMAC signature.
+      tags: [SubscriptionsByWorkflow]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SubscriptionByWorkflowCreate' }
+            example:
+              callbackUrl: "https://my-service.example.com/webhooks/workflow-monitor"
+              filter:
+                workflowId: "wf-invoice-approval-v1"
+                eventTypes: ["FinOSHITLEvent", "FinOSPolicyEvent"]
+              deliveryConfig:
+                secret: "workflow-monitor-secret"
+                maxRetries: 5
+                timeoutMs: 10000
+      responses:
+        "201":
+          description: Subscription registered
+          headers:
+            Location:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FinOSSubscriptionResponse' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "422": { $ref: '#/components/responses/ValidationError' }
+
+  /subscriptions/by-workflow/{subscriptionId}:
+    parameters:
+      - $ref: '#/components/parameters/subscriptionIdPath'
+
+    put:
+      operationId: reregisterSubscriptionByWorkflow
+      summary: "Use case (f-d) — Re-register (fully replace) a by-workflow subscription"
+      description: |
+        Fully replaces an existing by-workflow subscription.
+        The `filter.workflowId` may be changed to monitor a different workflow.
+        All other fields behave as in `PUT /subscriptions/by-event-type/{subscriptionId}`.
+      tags: [SubscriptionsByWorkflow]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SubscriptionByWorkflowCreate' }
+      responses:
+        "200":
+          description: Subscription replaced
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FinOSSubscriptionResponse' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "422": { $ref: '#/components/responses/ValidationError' }
+
+  # ── Subscriptions — By Workflow + Execution (use cases e & f-e) ──────────────
+
+  /subscriptions/by-execution:
+    post:
+      operationId: registerSubscriptionByExecution
+      summary: "Use case (e) — Register to receive events for a workflow ID and execution ID"
+      description: |
+        Registers a subscription to receive all `FinOSEvent` instances emitted
+        by a **specific workflow execution** — identified by both `workflowId`
+        and `workflowExecutionId`.
+
+        This is the most narrowly scoped subscription. Use it to:
+        - Monitor a single in-flight workflow run from an external service
+        - Receive HITL events for a specific invoice or transaction approval
+        - Build execution-specific audit streams
+
+        The subscription automatically moves to `EXPIRED` status when the
+        workflow execution reaches a terminal state (`COMPLETED`, `FAILED`,
+        `CANCELLED`), unless `expiresAt` is set to a later time.
+      tags: [SubscriptionsByExecution]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SubscriptionByExecutionCreate' }
+            example:
+              callbackUrl: "https://my-service.example.com/webhooks/execution-trace"
+              filter:
+                workflowId: "wf-invoice-approval-v1"
+                workflowExecutionId: "inst-abc123-def456"
+              deliveryConfig:
+                secret: "execution-trace-secret"
+                maxRetries: 3
+                timeoutMs: 5000
+      responses:
+        "201":
+          description: Subscription registered
+          headers:
+            Location:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FinOSSubscriptionResponse' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "422": { $ref: '#/components/responses/ValidationError' }
+
+  /subscriptions/by-execution/{subscriptionId}:
+    parameters:
+      - $ref: '#/components/parameters/subscriptionIdPath'
+
+    put:
+      operationId: reregisterSubscriptionByExecution
+      summary: "Use case (f-e) — Re-register (fully replace) a by-execution subscription"
+      description: |
+        Fully replaces an existing by-execution subscription.
+        Allows retargeting the subscription to a different execution by changing
+        `filter.workflowExecutionId`, or rotating the HMAC secret.
+      tags: [SubscriptionsByExecution]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SubscriptionByExecutionCreate' }
+      responses:
+        "200":
+          description: Subscription replaced
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FinOSSubscriptionResponse' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "422": { $ref: '#/components/responses/ValidationError' }
+
+  # ── Subscription Management (read + cancel) ───────────────────────────────────
+
+  /subscriptions:
+    get:
+      operationId: listSubscriptions
+      summary: List all subscriptions for the caller's tenant
+      tags: [SubscriptionManagement]
+      parameters:
+        - name: scope
+          in: query
+          description: Filter by subscription scope.
+          schema: { $ref: '#/components/schemas/SubscriptionScope' }
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/SubscriptionStatus' }
+        - name: workflowId
+          in: query
+          schema: { type: string }
+        - $ref: '#/components/parameters/filterParam'
+        - $ref: '#/components/parameters/sortParam'
+        - $ref: '#/components/parameters/sortOrderParam'
+        - $ref: '#/components/parameters/pageSizeParam'
+        - $ref: '#/components/parameters/pageStartIndexParam'
+      responses:
+        "200":
+          description: Paginated list of subscriptions
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FinOSSubscriptionListResponse' }
+
+  /subscriptions/{subscriptionId}:
+    parameters:
+      - $ref: '#/components/parameters/subscriptionIdPath'
+
+    get:
+      operationId: getSubscription
+      summary: Retrieve a subscription by ID
+      tags: [SubscriptionManagement]
+      responses:
+        "200":
+          description: Subscription record
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FinOSSubscriptionResponse' }
+        "404": { $ref: '#/components/responses/NotFound' }
+
+    delete:
+      operationId: cancelSubscription
+      summary: Cancel (soft-delete) a subscription
+      description: |
+        Cancels the subscription by setting its `status` to `CANCELLED`.
+        In-flight deliveries complete; no further events are dispatched.
+        Cancelled subscriptions are retained for 30 days for audit, then purged.
+      tags: [SubscriptionManagement]
+      responses:
+        "204": { description: Subscription cancelled }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "409": { $ref: '#/components/responses/Conflict' }
+
+# =============================================================================
+# COMPONENTS
+# =============================================================================
+components:
+
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-FinOS-API-Key
+
+  # ── Parameters ────────────────────────────────────────────────────────────────
+
+  parameters:
+    eventIdPath:
+      name: eventId
+      in: path
+      required: true
+      description: CloudEvent `id` of the published event.
+      schema: { type: string, example: "evt-classify-001" }
+
+    workflowIdPath:
+      name: workflowId
+      in: path
+      required: true
+      description: FinOSWorkflow definition identifier.
+      schema: { type: string, example: "wf-invoice-approval-v1" }
+
+    executionIdPath:
+      name: executionId
+      in: path
+      required: true
+      description: FinOSWorkflow execution instance ID (maps to `workflowInstanceId`).
+      schema: { type: string, format: uuid }
+
+    subscriptionIdPath:
+      name: subscriptionId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+    filterParam:
+      name: filter
+      in: query
+      required: false
+      description: |
+        FinOS standard filter expression.
+        Syntax: `field operator "value"` optionally joined by `and`.
+        Operators: `contains` (case-insensitive substring), `eq` (exact equality).
+        Supported fields: `subject`, `source`, `type`, `tenantId`, `workflowId`.
+      schema: { type: string }
+      examples:
+        subject_contains:
+          value: 'subject contains "invoice"'
+        type_eq:
+          value: 'type eq "com.example.finos.agent.classify"'
+        compound:
+          value: 'tenantId eq "tenant-acme-prod" and subject contains "invoice"'
+
+    sortParam:
+      name: sort
+      in: query
+      description: Field to sort by.
+      schema:
+        type: string
+        enum: [time, type, source, subject]
+        default: time
+
+    sortOrderParam:
+      name: sortOrder
+      in: query
+      description: Sort direction.
+      schema:
+        type: string
+        enum: [asc, desc]
+        default: desc
+
+    pageSizeParam:
+      name: pageSize
+      in: query
+      description: Number of results per page (1–100).
+      schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
+
+    pageStartIndexParam:
+      name: pageStartIndex
+      in: query
+      description: Zero-based start index for pagination.
+      schema: { type: integer, minimum: 0, default: 0 }
+
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      description: Unique key for safe retries. Same key within 24 h returns the original response.
+      schema: { type: string }
+
+  # ── Responses ─────────────────────────────────────────────────────────────────
+
+  responses:
+    NotFound:
+      description: "404 — Resource not found"
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+    BadRequest:
+      description: "400 — Malformed request"
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+    Unauthorized:
+      description: "401 — Authentication required"
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+    Conflict:
+      description: "409 — Conflict (already cancelled, duplicate ID)"
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+    ValidationError:
+      description: "422 — Schema or semantic validation failed"
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+
+  # ── Schemas ───────────────────────────────────────────────────────────────────
+
+  schemas:
+
+    # ── Enumerations (aligned with finos-workflow-execution-history-openapi.yaml) ─
+
+    FinOSEventType:
+      type: string
+      enum:
+        - FinOSAgentEvent
+        - FinOSAPIEvent
+        - FinOSHITLEvent
+        - FinOSPolicyEvent
+      description: |
+        Sub-type discriminator for FinOSEvent. Aligned with `FinOSEventType` in
+        `finos-workflow-execution-history-openapi.yaml`.
+
+    FinOSPolicyEvaluationOutcome:
+      type: string
+      enum: [Success, Escalate, AttentionRequired, Failed]
+      description: Outcome of a FinOSPolicy evaluation. Drives EVALUATED_EDGE routing.
+
+    AgentType:
+      type: string
+      enum: [ORCHESTRATOR, PLANNER, EXECUTOR, REVIEWER, MONITOR,
+             EXTRACTOR, CLASSIFIER, SUMMARIZER, CUSTOM]
+
+    HITLDecision:
+      type: string
+      enum: [APPROVED, REJECTED, ESCALATED, ACKNOWLEDGED, DEFERRED]
+
+    HttpMethod:
+      type: string
+      enum: [GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS]
+
+    NodeStatus:
+      type: string
+      enum: [PENDING, RUNNING, COMPLETED, FAILED, SKIPPED, RETRYING]
+
+    PolicyType:
+      type: string
+      enum: [APPROVAL, COMPLIANCE, RISK, ACCESS_CONTROL, DATA_GOVERNANCE]
+
+    SubscriptionScope:
+      type: string
+      enum: [BY_EVENT_TYPE, BY_WORKFLOW, BY_EXECUTION]
+      description: The matching scope for which this subscription was registered.
+
+    SubscriptionStatus:
+      type: string
+      enum: [ACTIVE, SUSPENDED, EXPIRED, CANCELLED]
+
+    EventPriority:
+      type: string
+      enum: [LOW, MEDIUM, HIGH, CRITICAL]
+      description: |
+        NEW — Optional priority hint that may affect delivery ordering.
+
+    # ── CloudEvent Base ───────────────────────────────────────────────────────
+    # Identical to CloudEventBase in finos-workflow-execution-history-openapi.yaml
+
+    CloudEventBase:
+      type: object
+      required: [id, source, specversion, type]
+      description: |
+        CloudEvents v1.0 required and optional attributes.
+        See https://github.com/cloudevents/spec/blob/main/cloudevents/spec.md
+      properties:
+        id:
+          type: string
+          description: |
+            [CloudEvent] Unique event identifier per source.
+            Producer MUST ensure `source` + `id` is globally unique per distinct event.
+          example: "evt-classify-001"
+        source:
+          type: string
+          format: uri-reference
+          description: "[CloudEvent] URI identifying the event producer context."
+          example: "{source-root}/finos/agent/invoice-classifier"
+        specversion:
+          type: string
+          enum: ["1.0"]
+          description: "[CloudEvent] CloudEvents spec version. Must be \"1.0\"."
+        type:
+          type: string
+          description: |
+            [CloudEvent] Reverse-DNS event type string.
+            FinOS convention: `{event-namespace}.finos.{domain}.{action}`
+          example: "{event-namespace}.finos.agent.classify"
+        datacontenttype:
+          type: string
+          description: "[CloudEvent] RFC 2046 MIME type of the `data` value."
+          example: "application/json"
+        dataschema:
+          type: string
+          format: uri
+          description: "[CloudEvent] Schema URI for `data`."
+        subject:
+          type: string
+          description: "[CloudEvent] Event subject within the producer context."
+          example: "invoice/INV-2026-00441"
+        time:
+          type: string
+          format: date-time
+          description: "[CloudEvent] RFC 3339 timestamp of occurrence."
+        data:
+          description: "[CloudEvent] Domain-specific event payload."
+
+    # ── FinOSEvent Core (extends CloudEvent + FinOS extensions) ───────────────
+    # Equivalent to FinOSEventBase in finos-workflow-execution-history-openapi.yaml
+    # with workflowInstanceId made optional for standalone publishing (use case a).
+
+    FinOSEventCore:
+      description: |
+        Core FinOS event schema extending CloudEvent v1.0 with FinOS governance
+        extensions. Compatible with `FinOSEventBase` in
+        `finos-workflow-execution-history-openapi.yaml`.
+
+        **Differences from FinOSEventBase:**
+        - `workflowInstanceId` is **optional** (required only in workflow-context publishing)
+        - `workflowId` is a **new optional field** (workflow definition identifier)
+        - `nodeId`, `sessionId`, `priority`, `expiresAt` are new optional fields
+      allOf:
+        - $ref: '#/components/schemas/CloudEventBase'
+        - type: object
+          required: [finOSEventType, tenantId]
+          properties:
+            finOSEventType:
+              $ref: '#/components/schemas/FinOSEventType'
+              description: FinOS sub-type discriminator.
+            tenantId:
+              type: string
+              description: Tenant identifier.
+            workflowInstanceId:
+              type: [string, "null"]
+              format: uuid
+              description: |
+                ID of the FinOSWorkflowExecutionHistory instance this event belongs to.
+                Required when publishing via the workflow-context endpoint (use case b).
+                Optional for standalone events (use case a).
+            workflowId:
+              type: [string, "null"]
+              description: |
+                NEW — FinOSWorkflow definition identifier.
+                Links the event to the workflow definition (not just the execution instance).
+              example: "wf-invoice-approval-v1"
+            nodeId:
+              type: [string, "null"]
+              description: |
+                NEW — Identifier of the workflow DAG node that emitted this event.
+                Matches the `nodeId` from the FinOSWorkflow DAG definition.
+              example: "node-classify-invoice"
+            correlationId:
+              type: [string, "null"]
+              format: uuid
+              description: Distributed tracing correlation ID across FinOS services.
+            traceId:
+              type: [string, "null"]
+              description: OpenTelemetry W3C TraceContext trace ID.
+            spanId:
+              type: [string, "null"]
+              description: OpenTelemetry span ID.
+            sessionId:
+              type: [string, "null"]
+              description: |
+                NEW — Session identifier for multi-turn agent interactions.
+                Links events belonging to the same conversational session.
+            priority:
+              oneOf:
+                - $ref: '#/components/schemas/EventPriority'
+                - type: "null"
+              description: NEW — Event priority hint for delivery ordering.
+            expiresAt:
+              type: [string, "null"]
+              format: date-time
+              description: |
+                NEW — TTL for this event. After this time the event service
+                will not attempt new deliveries. `null` = no expiry.
+
+    # ── FinOSEvent (discriminated union of all subtypes) ──────────────────────
+
+    FinOSEvent:
+      description: |
+        Polymorphic FinOSEvent. The `finOSEventType` field is the discriminator.
+        Matches the discriminator mapping used in
+        `finos-workflow-execution-history-openapi.yaml`.
+      discriminator:
+        propertyName: finOSEventType
+        mapping:
+          FinOSAgentEvent:  '#/components/schemas/FinOSAgentEvent'
+          FinOSAPIEvent:    '#/components/schemas/FinOSAPIEvent'
+          FinOSHITLEvent:   '#/components/schemas/FinOSHITLEvent'
+          FinOSPolicyEvent: '#/components/schemas/FinOSPolicyEvent'
+      oneOf:
+        - $ref: '#/components/schemas/FinOSAgentEvent'
+        - $ref: '#/components/schemas/FinOSAPIEvent'
+        - $ref: '#/components/schemas/FinOSHITLEvent'
+        - $ref: '#/components/schemas/FinOSPolicyEvent'
+
+    # ── FinOSAgentEvent ───────────────────────────────────────────────────────
+
+    FinOSAgentEvent:
+      description: |
+        FinOSEvent subtype representing an LLM agent action.
+        Aligned with `FinOSAgentEventVertex` in
+        `finos-workflow-execution-history-openapi.yaml`.
+
+        **New optional fields:** `agentCardVersion`, `contextModes`, `a2aProtocolVersion`
+      allOf:
+        - $ref: '#/components/schemas/FinOSEventCore'
+        - type: object
+          properties:
+            agent:
+              $ref: '#/components/schemas/Agent'
+              description: Agent identity and metadata.
+            agentRun:
+              $ref: '#/components/schemas/AgentRun'
+              description: Run metadata including status, timing, and token usage.
+            llmModelName:
+              type: string
+              maxLength: 255
+              description: Name of the LLM used (e.g. `claude-sonnet-4-6`).
+              example: "claude-sonnet-4-6"
+            llmModelVersion:
+              type: string
+              description: Version string of the LLM.
+              example: "20250514"
+            promptTemplate:
+              type: string
+              description: Prompt template ID or content used for this invocation.
+            toolCalls:
+              type: array
+              items: { $ref: '#/components/schemas/ToolCall' }
+              description: Tool calls made by the agent during execution.
+            skills:
+              type: array
+              items: { $ref: '#/components/schemas/Skill' }
+              description: Active skills during this agent event.
+            humanTask:
+              $ref: '#/components/schemas/HumanTask'
+              description: HITL task generated by this agent event, if any.
+            humanDecision:
+              $ref: '#/components/schemas/HumanDecision'
+              description: Human decision recorded against this event, if any.
+            evidence:
+              $ref: '#/components/schemas/Evidence'
+              description: Evidence artifact captured during this event.
+            # ── NEW optional fields ─────────────────────────────────────────
+            agentCardVersion:
+              type: [string, "null"]
+              description: |
+                NEW — Semantic version of the FinOSAgentCard used for this invocation.
+              example: "1.2.0"
+            contextModes:
+              type: [array, "null"]
+              items:
+                type: string
+                enum: [RAG_QUERY, RAG_TENSOR, FINOSWORKFLOW_GRAPH, STRUCTURED_CHUNKS]
+              description: |
+                NEW — Context graph modes active during this agent invocation.
+                Aligns with `finOSSupportedContextModes` in FinOSAgentCard.
+            a2aProtocolVersion:
+              type: [string, "null"]
+              description: |
+                NEW — Version of the Agent-to-Agent (A2A) protocol used.
+              example: "1.0"
+
+    # ── FinOSAPIEvent ─────────────────────────────────────────────────────────
+
+    FinOSAPIEvent:
+      description: |
+        FinOSEvent subtype representing an external API call.
+        Aligned with `FinOSAPIEventVertex` in
+        `finos-workflow-execution-history-openapi.yaml`.
+
+        **New optional fields:** `retryStrategy`, `cacheHit`, `authScheme`
+      allOf:
+        - $ref: '#/components/schemas/FinOSEventCore'
+        - type: object
+          properties:
+            endpoint:
+              type: string
+              format: uri
+              description: URI of the API endpoint called.
+            httpMethod:
+              $ref: '#/components/schemas/HttpMethod'
+            requestHeaders:
+              type: object
+              additionalProperties: { type: string }
+              description: HTTP request headers (sensitive values redacted).
+            requestBody:
+              type: object
+              additionalProperties: true
+            responseStatusCode:
+              type: integer
+              minimum: 100
+              maximum: 599
+            responseHeaders:
+              type: object
+              additionalProperties: { type: string }
+            responseBody:
+              type: object
+              additionalProperties: true
+            latencyMs:
+              type: integer
+              minimum: 0
+              description: API call round-trip latency in milliseconds.
+            apiVersion:
+              type: string
+            retryAttempt:
+              type: integer
+              minimum: 0
+              default: 0
+              description: Zero-based retry attempt count (0 = first attempt).
+            # ── NEW optional fields ─────────────────────────────────────────
+            retryStrategy:
+              type: [string, "null"]
+              enum: [EXPONENTIAL_BACKOFF, FIXED_DELAY, NONE, null]
+              description: NEW — Retry strategy applied to this call.
+            cacheHit:
+              type: [boolean, "null"]
+              description: NEW — Whether the response was served from a cache.
+            authScheme:
+              type: [string, "null"]
+              enum: [OIDC, API_KEY, BEARER, NONE, null]
+              description: NEW — Authentication scheme used for this API call.
+
+    # ── FinOSHITLEvent ────────────────────────────────────────────────────────
+
+    FinOSHITLEvent:
+      description: |
+        FinOSEvent subtype representing a Human-in-the-Loop (HITL) event.
+        Aligned with `FinOSHITLEventVertex` in
+        `finos-workflow-execution-history-openapi.yaml`.
+
+        **New optional fields:** `callbackUrl`, `timeoutAt`, `notificationChannels`, `priorityLevel`
+      allOf:
+        - $ref: '#/components/schemas/FinOSEventCore'
+        - type: object
+          properties:
+            assignedTo:
+              type: string
+              description: User identity or role assigned to the HITL task.
+            taskType:
+              type: string
+              enum: [REVIEW, APPROVE, REJECT, ESCALATE, ACKNOWLEDGE, OVERRIDE]
+            taskDescription:
+              type: string
+              maxLength: 8192
+            dueDate:
+              type: string
+              format: date-time
+            completedAt:
+              type: [string, "null"]
+              format: date-time
+            decision:
+              oneOf:
+                - $ref: '#/components/schemas/HITLDecision'
+                - type: "null"
+            justification:
+              type: [string, "null"]
+              maxLength: 4096
+            attachments:
+              type: array
+              items: { type: string, format: uri }
+              description: URIs of supporting documents.
+            escalationChain:
+              type: array
+              items: { type: string }
+              description: Ordered list of roles / users in the escalation path.
+            # ── NEW optional fields ─────────────────────────────────────────
+            callbackUrl:
+              type: [string, "null"]
+              format: uri
+              description: |
+                NEW — FinOS Workflows callback URL generated for this HITL task.
+                The reviewer POSTs their decision to this URL to resume the workflow.
+            timeoutAt:
+              type: [string, "null"]
+              format: date-time
+              description: |
+                NEW — Timestamp at which the HITL task expires and the workflow
+                raises a TimeoutError if no decision has been recorded.
+            notificationChannels:
+              type: [array, "null"]
+              items: { type: string }
+              description: |
+                NEW — Channels through which task notification was sent
+                (e.g. "email", "slack", "task-portal").
+            priorityLevel:
+              type: [string, "null"]
+              enum: [LOW, MEDIUM, HIGH, CRITICAL, null]
+              description: NEW — Task priority level displayed in the HITL task portal.
+
+    # ── FinOSPolicyEvent ──────────────────────────────────────────────────────
+
+    FinOSPolicyEvent:
+      description: |
+        FinOSEvent subtype representing a FinOSPolicy evaluation event.
+        Aligned with `FinOSPolicyEventVertex` in
+        `finos-workflow-execution-history-openapi.yaml`.
+
+        **New optional fields:** `policyCategory`, `policyVersion`, `overrideApplied`, `overrideReason`
+      allOf:
+        - $ref: '#/components/schemas/FinOSEventCore'
+        - type: object
+          required: [finOSPolicyId, finOSPolicyEvaluationOutcome]
+          properties:
+            finOSPolicyId:
+              type: string
+              description: Identifier of the FinOSPolicy that was evaluated.
+              example: "pol-spending-limit-v3"
+            finOSPolicyEvaluationOutcome:
+              $ref: '#/components/schemas/FinOSPolicyEvaluationOutcome'
+              description: Result of the policy evaluation.
+            targetEscalationRole:
+              type: [string, "null"]
+              description: Role to escalate to on `Escalate` or `AttentionRequired` outcome.
+              example: "finance-manager"
+            evaluationInputs:
+              type: object
+              additionalProperties: true
+              description: Input context fed to the policy evaluator.
+            evaluationOutputs:
+              type: [object, "null"]
+              additionalProperties: true
+              description: Raw output produced by the policy evaluator.
+            evaluatedAt:
+              type: string
+              format: date-time
+            # ── NEW optional fields ─────────────────────────────────────────
+            policyCategory:
+              oneOf:
+                - $ref: '#/components/schemas/PolicyType'
+                - type: "null"
+              description: |
+                NEW — Category of the evaluated policy. Denormalized from the
+                FinOSPolicy record for subscriber convenience.
+            policyVersion:
+              type: [string, "null"]
+              description: |
+                NEW — Semantic version of the FinOSPolicy active at evaluation time.
+              example: "3.0.0"
+            overrideApplied:
+              type: [boolean, "null"]
+              description: |
+                NEW — Whether a human override was applied to this policy evaluation.
+            overrideReason:
+              type: [string, "null"]
+              description: |
+                NEW — Justification provided when `overrideApplied: true`.
+
+    # ── Supporting schemas (from finos-workflow-execution-history-openapi.yaml) ─
+
+    Agent:
+      type: object
+      required: [agentId, agentName]
+      properties:
+        agentId: { type: string, format: uuid }
+        agentName: { type: string, maxLength: 255 }
+        agentType: { $ref: '#/components/schemas/AgentType' }
+        agentVersion: { type: string, pattern: '^\d+\.\d+\.\d+$' }
+        description: { type: string, maxLength: 1024 }
+        capabilities: { type: array, items: { type: string } }
+
+    AgentRun:
+      type: object
+      required: [runId]
+      properties:
+        runId: { type: string, format: uuid }
+        runStatus: { $ref: '#/components/schemas/NodeStatus' }
+        startTime: { type: string, format: date-time }
+        endTime: { type: string, format: date-time }
+        tokenUsage:
+          type: object
+          properties:
+            inputTokens: { type: integer, minimum: 0 }
+            outputTokens: { type: integer, minimum: 0 }
+            totalTokens: { type: integer, minimum: 0 }
+            estimatedCostUsd: { type: number, format: double, minimum: 0 }
+
+    Skill:
+      type: object
+      required: [skillId, skillName]
+      properties:
+        skillId: { type: string, format: uuid }
+        skillName: { type: string, maxLength: 255 }
+        skillVersion: { type: string }
+        skillType: { type: string }
+        description: { type: string }
+        permittedTools: { type: array, items: { type: string } }
+
+    ToolCall:
+      type: object
+      required: [toolCallId, toolName]
+      properties:
+        toolCallId: { type: string, format: uuid }
+        toolName: { type: string, maxLength: 255 }
+        toolInput: { type: object, additionalProperties: true }
+        toolOutput: { type: object, additionalProperties: true }
+        executionTimeMs: { type: integer, minimum: 0 }
+        status: { $ref: '#/components/schemas/NodeStatus' }
+        errorMessage: { type: [string, "null"] }
+
+    HumanTask:
+      type: object
+      required: [taskId, taskType, assignedTo]
+      properties:
+        taskId: { type: string, format: uuid }
+        taskType: { type: string }
+        assignedTo: { type: string }
+        description: { type: string, maxLength: 4096 }
+        dueDate: { type: string, format: date-time }
+        priority: { type: string, enum: [LOW, MEDIUM, HIGH, CRITICAL] }
+        instructions: { type: string, maxLength: 8192 }
+
+    HumanDecision:
+      type: object
+      required: [decisionId, decision, decidedBy, decidedAt]
+      properties:
+        decisionId: { type: string, format: uuid }
+        decision: { $ref: '#/components/schemas/HITLDecision' }
+        justification: { type: string, maxLength: 4096 }
+        decidedBy: { type: string }
+        decidedAt: { type: string, format: date-time }
+        attachments: { type: array, items: { type: string, format: uri } }
+
+    Evidence:
+      type: object
+      required: [evidenceId, evidenceType]
+      properties:
+        evidenceId: { type: string, format: uuid }
+        evidenceType: { type: string, maxLength: 128 }
+        evidenceData: { type: object, additionalProperties: true }
+        source: { type: string, maxLength: 512 }
+        collectedAt: { type: string, format: date-time }
+        hash:
+          type: string
+          description: SHA-256 hash for tamper detection.
+
+    # ── Subscription schemas ───────────────────────────────────────────────────
+
+    SubscriptionDeliveryConfig:
+      type: object
+      description: Controls how events are delivered to the subscriber's callbackUrl.
+      properties:
+        secret:
+          type: [string, "null"]
+          description: |
+            HMAC-SHA256 signing secret. When set, every delivery request carries:
+            `X-FinOS-Signature: sha256={HMAC-SHA256(body, secret)}`
+            The subscriber MUST verify this signature before processing.
+          minLength: 16
+        maxRetries:
+          type: integer
+          minimum: 0
+          maximum: 10
+          default: 3
+          description: Max delivery retry attempts on non-2xx response or timeout.
+        timeoutMs:
+          type: integer
+          minimum: 1000
+          maximum: 30000
+          default: 5000
+          description: |
+            Max milliseconds to wait for a 2xx response from callbackUrl.
+            The event service treats timeout as a delivery failure and retries.
+        retryBackoffMs:
+          type: integer
+          minimum: 100
+          default: 2000
+          description: Base backoff duration between retry attempts (exponential).
+        includeEventPayload:
+          type: boolean
+          default: true
+          description: |
+            If `false`, the delivery body contains only envelope metadata and a
+            `eventId` reference. The subscriber fetches the event body separately
+            via `GET /event-service/v1/events/{eventId}`. Useful for large events.
+
+    SubscriptionEventTypeFilter:
+      type: object
+      required: [eventTypes]
+      description: Filter for by-event-type subscriptions (use case c).
+      properties:
+        eventTypes:
+          type: array
+          items: { $ref: '#/components/schemas/FinOSEventType' }
+          minItems: 1
+          description: One or more FinOSEventType values to match.
+        tenantId:
+          type: [string, "null"]
+          description: Restrict to events from a specific tenant (defaults to caller's tenant).
+        sourcePattern:
+          type: [string, "null"]
+          description: |
+            Glob pattern matched against the CloudEvent `source` field.
+            Example: `{source-root}/finos/agent/*`
+
+    SubscriptionWorkflowFilter:
+      type: object
+      required: [workflowId]
+      description: Filter for by-workflow subscriptions (use case d).
+      properties:
+        workflowId:
+          type: string
+          description: FinOSWorkflow definition ID. All executions of this workflow are matched.
+          example: "wf-invoice-approval-v1"
+        eventTypes:
+          type: [array, "null"]
+          items: { $ref: '#/components/schemas/FinOSEventType' }
+          description: Optional additional filter to specific event subtypes within this workflow.
+
+    SubscriptionExecutionFilter:
+      type: object
+      required: [workflowId, workflowExecutionId]
+      description: Filter for by-execution subscriptions (use case e).
+      properties:
+        workflowId:
+          type: string
+          description: FinOSWorkflow definition ID.
+          example: "wf-invoice-approval-v1"
+        workflowExecutionId:
+          type: string
+          format: uuid
+          description: |
+            Specific workflow execution instance ID (maps to `workflowInstanceId`).
+            Only events from this execution are delivered.
+        eventTypes:
+          type: [array, "null"]
+          items: { $ref: '#/components/schemas/FinOSEventType' }
+          description: Optional filter to specific event subtypes within this execution.
+
+    # Base shared by all subscription create requests
+    SubscriptionCreateBase:
+      type: object
+      required: [callbackUrl]
+      properties:
+        callbackUrl:
+          type: string
+          format: uri
+          description: |
+            HTTPS endpoint to which matching events are POSTed.
+            Must respond with `2xx` within `deliveryConfig.timeoutMs`.
+          example: "https://my-service.example.com/webhooks/finos"
+        deliveryConfig:
+          $ref: '#/components/schemas/SubscriptionDeliveryConfig'
+        expiresAt:
+          type: [string, "null"]
+          format: date-time
+          description: |
+            Subscription expiry time. After this the subscription moves to `EXPIRED`
+            and no further deliveries are made. `null` = no expiry.
+        metadata:
+          type: [object, "null"]
+          additionalProperties: true
+          description: Free-form key-value metadata for caller-side bookkeeping.
+
+    SubscriptionByEventTypeCreate:
+      allOf:
+        - $ref: '#/components/schemas/SubscriptionCreateBase'
+        - type: object
+          required: [filter]
+          properties:
+            filter: { $ref: '#/components/schemas/SubscriptionEventTypeFilter' }
+
+    SubscriptionByWorkflowCreate:
+      allOf:
+        - $ref: '#/components/schemas/SubscriptionCreateBase'
+        - type: object
+          required: [filter]
+          properties:
+            filter: { $ref: '#/components/schemas/SubscriptionWorkflowFilter' }
+
+    SubscriptionByExecutionCreate:
+      allOf:
+        - $ref: '#/components/schemas/SubscriptionCreateBase'
+        - type: object
+          required: [filter]
+          properties:
+            filter: { $ref: '#/components/schemas/SubscriptionExecutionFilter' }
+
+    FinOSEventSubscription:
+      type: object
+      description: A registered event subscription record.
+      required: [subscriptionId, scope, callbackUrl, status, createdAt]
+      properties:
+        subscriptionId: { type: string, format: uuid, readOnly: true }
+        scope: { $ref: '#/components/schemas/SubscriptionScope' }
+        callbackUrl: { type: string, format: uri }
+        filter:
+          description: Scope-specific filter (EventTypeFilter | WorkflowFilter | ExecutionFilter)
+          oneOf:
+            - $ref: '#/components/schemas/SubscriptionEventTypeFilter'
+            - $ref: '#/components/schemas/SubscriptionWorkflowFilter'
+            - $ref: '#/components/schemas/SubscriptionExecutionFilter'
+        deliveryConfig: { $ref: '#/components/schemas/SubscriptionDeliveryConfig' }
+        status: { $ref: '#/components/schemas/SubscriptionStatus' }
+        expiresAt: { type: [string, "null"], format: date-time }
+        metadata: { type: [object, "null"], additionalProperties: true }
+        tenantId: { type: string }
+        createdBy: { type: [string, "null"] }
+        createdAt: { type: string, format: date-time, readOnly: true }
+        updatedAt: { type: string, format: date-time, readOnly: true }
+        deliveryStats:
+          type: object
+          description: Rolling delivery statistics (last 24 hours).
+          properties:
+            totalDelivered: { type: integer }
+            totalFailed: { type: integer }
+            lastDeliveredAt: { type: [string, "null"], format: date-time }
+            lastFailureAt: { type: [string, "null"], format: date-time }
+
+    # ── Event delivery envelope (POSTed to callbackUrl) ────────────────────────
+
+    FinOSEventDelivery:
+      type: object
+      description: |
+        Payload POSTed to a subscriber's `callbackUrl` for each matched event.
+
+        **Delivery request headers:**
+        ```
+        Content-Type: application/json
+        X-FinOS-Delivery-Id: {uuid}
+        X-FinOS-Subscription-Id: {subscriptionId}
+        X-FinOS-Event-Type: {finOSEventType}
+        X-FinOS-Signature: sha256={hmac}    (present when secret is configured)
+        ```
+      required: [deliveryId, subscriptionId, attempt, event]
+      properties:
+        deliveryId:
+          type: string
+          format: uuid
+          description: Unique ID for this delivery attempt.
+        subscriptionId:
+          type: string
+          format: uuid
+        attempt:
+          type: integer
+          minimum: 1
+          description: Delivery attempt number (1 = first attempt).
+        deliveredAt:
+          type: string
+          format: date-time
+        event:
+          $ref: '#/components/schemas/FinOSEvent'
+          description: |
+            The full FinOSEvent. Omitted when `deliveryConfig.includeEventPayload: false`
+            (use `eventId` to fetch separately).
+        eventId:
+          type: string
+          description: CloudEvent `id` field (always present, even when `event` is omitted).
+
+    # ── Response envelopes ─────────────────────────────────────────────────────
+
+    Meta:
+      type: object
+      properties:
+        requestId: { type: string }
+        timestamp: { type: string, format: date-time }
+        apiVersion: { type: string, example: "1.0" }
+
+    PaginationMeta:
+      type: object
+      properties:
+        pageSize: { type: integer }
+        pageStartIndex: { type: integer }
+        totalCount: { type: integer }
+        hasNext: { type: boolean }
+        hasPrev: { type: boolean }
+
+    FinOSEventResponse:
+      type: object
+      properties:
+        data: { $ref: '#/components/schemas/FinOSEvent' }
+        meta: { $ref: '#/components/schemas/Meta' }
+
+    FinOSEventListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/FinOSEvent' }
+        meta:
+          allOf:
+            - $ref: '#/components/schemas/Meta'
+            - type: object
+              properties:
+                pagination: { $ref: '#/components/schemas/PaginationMeta' }
+
+    FinOSSubscriptionResponse:
+      type: object
+      properties:
+        data: { $ref: '#/components/schemas/FinOSEventSubscription' }
+        meta: { $ref: '#/components/schemas/Meta' }
+
+    FinOSSubscriptionListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/FinOSEventSubscription' }
+        meta:
+          allOf:
+            - $ref: '#/components/schemas/Meta'
+            - type: object
+              properties:
+                pagination: { $ref: '#/components/schemas/PaginationMeta' }
+
+    HealthResponse:
+      type: object
+      required: [status, timestamp]
+      properties:
+        status: { type: string, enum: [ok, degraded, unhealthy] }
+        version: { type: string }
+        timestamp: { type: string, format: date-time }
+        checks:
+          type: object
+          properties:
+            liveness:
+              type: object
+              properties:
+                status: { type: string, enum: [pass, fail] }
+                latencyMs: { type: integer }
+            datastore:
+              type: object
+              properties:
+                status: { type: string, enum: [pass, fail] }
+                latencyMs: { type: integer }
+                errorMessage: { type: [string, "null"] }
+            messageQueue:
+              type: object
+              properties:
+                status: { type: string, enum: [pass, fail] }
+                latencyMs: { type: integer }
+                errorMessage: { type: [string, "null"] }
+
+    ProblemDetails:
+      type: object
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: [string, "null"] }
+        instance: { type: [string, "null"] }
+        traceId: { type: [string, "null"] }
+        timestamp: { type: string, format: date-time }
+        errors:
+          type: [array, "null"]
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              code: { type: string }
+              message: { type: string }

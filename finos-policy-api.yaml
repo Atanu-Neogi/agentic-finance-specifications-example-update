@@ -1,0 +1,1806 @@
+openapi: 3.1.0
+
+# =============================================================================
+# FinOS Policy Service API
+# Version:      1.0.0
+# Service:      finos-policy-service
+# Platform:     Blackline FinOS Orchestration Platform
+#
+# Two-layer model:
+#   PolicyDefinition    — tenant-agnostic, versioned SHAPE (variables +
+#                         possibleOutcomes). Referenced from a workflow's
+#                         FinOSPolicy node by policyDefinitionId.
+#   PolicyConfiguration — tenant-specific condition + enforcement at one
+#                         (workflowConfigId, nodeId) placement, pinned to a
+#                         Definition version at save time.
+#
+# Schema alignment:
+#   finos-workflow-api.yaml                      → FinOSPolicyNode.policyDefinitionId
+#   finos-workflow-execution-history-openapi.yaml → FinOSPolicyEventVertex,
+#                                                    FinOSPolicyEvaluationOutcome
+# =============================================================================
+
+info:
+  title: FinOS Policy Service API
+  version: 1.0.0
+  description: |
+    REST API for the authoring lifecycle and runtime evaluation of **FinOS policies**
+    on the Blackline FinOS Orchestration Platform.
+
+    ## Two-Layer Model
+
+    A **Policy Definition** is a tenant-agnostic, reusable *shape* — a declared
+    variable catalog and a **closed allow-list** of possible outcomes, versioned.
+    A workflow blueprint's `FinOSPolicy` node references a Definition by
+    `policyDefinitionId`. Definitions carry **no** condition, enforcement, or tenant.
+
+    A **Policy Configuration** is the tenant-specific configuration of a Definition
+    at one workflow node — the actual `condition` and `enforcement` — pinned to a
+    specific Definition version at save time. One Configuration exists per
+    `(tenant, workflowConfigId, nodeId)`.
+
+    At runtime the service resolves the calling tenant's Configuration for a
+    `(workflowConfigId, nodeId)` placement and evaluates its condition and
+    enforcement.
+
+    ```
+    PolicyDefinition  (tenant-agnostic shape)
+         │  variables[]  ·  possibleOutcomes[]  ·  versioned
+         │
+         ├─▶ PolicyConfiguration  (tenant A, workflowConfigId, nodeId)
+         │       condition + enforcement, pinned to Definition v1
+         │
+         └─▶ PolicyConfiguration  (tenant B, workflowConfigId, nodeId)
+                 condition + enforcement, pinned to Definition v1
+    ```
+
+    ## Runtime Contract
+
+    - A `FinOSPolicy` node is evaluated via `POST /policies/{policyDefinitionId}/evaluate`
+    - The response `outcome` becomes the `policy_outcome` workflow variable, which
+      drives outgoing edge conditions in the calling DAG
+    - Each evaluation is recorded as a `FinOSPolicyEventVertex` in
+      `FinOSWorkflowExecutionHistory`
+
+    ## Fail-Closed Semantics
+
+    A missing Configuration, a Definition-id mismatch, a stored condition that fails
+    to compile, a strict-coercion failure, or an evaluator runtime error all produce a
+    deterministic `outcome: "Failed" / action: "BLOCK"` envelope with the cause in
+    `reason` — **never** a `5xx`. HTTP error codes are reserved for authoring-time and
+    transport failures.
+
+    ## Definition Lifecycle
+
+    ```
+    DRAFT ──▶ ACTIVE ──▶ INACTIVE ──▶ ACTIVE (reactivate)
+                 └──▶ DEPRECATED  (superseded; read-only)
+                 └──▶ DISABLED    (administrative hold)
+    ```
+
+    Policy Configurations have **no** status lifecycle — they are always active and
+    evolve only by version bump.
+
+    ## Schema Alignment
+
+    | This spec | Aligned artifact |
+    |---|---|
+    | `policyDefinitionId` | `FinOSPolicyNode.policyDefinitionId` in `finos-workflow-api.yaml` |
+    | `POST /policies/{policyDefinitionId}/evaluate` | `FinOSPolicyNode` runtime invocation pattern |
+    | `PolicyEvaluateResult.outcome` | Edge condition variable `policy_outcome` in workflow YAML |
+    | `StandardOutcome` | `FinOSPolicyEvaluationOutcome` in `finos-workflow-execution-history-openapi.yaml` |
+    | `FinOSPlatformInvariant` | System-seeded, tenant-independent governance invariants |
+
+    ## Base URL
+    `https://api.example.com/finos-policy-service/v1`
+
+  contact:
+    name: Blackline Platform Engineering
+    email: platform-eng@blackline.com
+    url: https://developer.blackline.com/finos
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+servers:
+  - url: https://api.example.com/finos-policy-service/v1
+    description: Production
+  - url: https://api-sandbox.example.com/finos-policy-service/v1
+    description: Sandbox / Development
+
+security:
+  - BearerAuth: []
+  - ApiKeyAuth: []
+
+tags:
+  - name: Health
+    description: Liveness and dependency connectivity checks
+  - name: PolicyDefinitions
+    description: Tenant-agnostic Policy Definition authoring, versioning, and lifecycle
+  - name: PolicyConfigurations
+    description: Tenant-specific condition and enforcement bound to one workflow node
+  - name: Evaluation
+    description: Runtime policy evaluation — the endpoint called by the FinOS Workflows Engine
+  - name: PlatformInvariants
+    description: System-seeded platform-level governance invariants (read-only)
+
+# =============================================================================
+# PATHS
+# =============================================================================
+paths:
+
+  # ── Health ──────────────────────────────────────────────────────────────────
+
+  /health:
+    get:
+      operationId: getHealth
+      summary: Liveness and datastore connectivity check
+      description: |
+        Returns the liveness status of the FinOS Policy Service and its connectivity
+        to the backing datastore. Suitable for use by load balancer health probes
+        and external monitoring systems.
+
+        - `ok` — all checks passing; service fully operational
+        - `degraded` — service alive but a dependency check is failing
+        - `unhealthy` — critical dependency unavailable; returns `503`
+      tags: [Health]
+      security: []
+      responses:
+        "200":
+          description: Service is live (ok or degraded)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthResponse' }
+        "503":
+          description: Service or critical dependency unavailable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthResponse' }
+
+  # ── Policy Definitions — Collection ─────────────────────────────────────────
+
+  /policy-definitions:
+    get:
+      operationId: listPolicyDefinitions
+      summary: List Policy Definitions
+      description: |
+        Returns Policy Definitions visible to the caller, newest first by default.
+
+        Each entry carries its **usage pills** — `availableToBlueprints` (distinct
+        workflow definitions whose `FinOSPolicy` node references this Definition)
+        and `appliedToWorkflows` (distinct workflows for which a tenant has authored
+        a Policy Configuration against it).
+      tags: [PolicyDefinitions]
+      parameters:
+        - $ref: '#/components/parameters/statusFilter'
+        - $ref: '#/components/parameters/filterParam'
+        - $ref: '#/components/parameters/sortParam'
+        - $ref: '#/components/parameters/sortOrderParam'
+        - $ref: '#/components/parameters/pageSizeParam'
+        - $ref: '#/components/parameters/pageStartIndexParam'
+      responses:
+        "200":
+          description: Policy Definitions returned
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyDefinitionListResponse' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+
+    post:
+      operationId: createPolicyDefinition
+      summary: Create a Policy Definition with a server-minted id
+      description: |
+        Creates a Policy Definition and mints its identifier (`pol_<uuid>_v1`).
+        The Definition starts in `DRAFT` at version `1.0.0` and must be activated
+        before Policy Configurations can be authored against it.
+
+        A Definition declares its reusable shape in one of two ways:
+
+        - **`variables` declared directly** — each authored Configuration supplies
+          its own condition over that variable set.
+        - **A Definition-level `condition`** — `variables` is *derived* from the
+          condition's leaves and need not be supplied separately. A Definition-level
+          condition may reference `CONFIGURATION_INPUT` operands, which a tenant
+          fills in when authoring its Configuration.
+
+        Either way the Definition owns the shape; the concrete condition that runs at
+        a node is fixed when a tenant authors the Configuration.
+
+        For idempotent authoring under a caller-supplied id, use
+        `PUT /policy-definitions/{definitionId}` instead.
+      tags: [PolicyDefinitions]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PolicyDefinitionCreate' }
+            example:
+              name: "Invoice Approval Gate"
+              description: "Shape for invoice-approval policies: amount + risk inputs, standard outcomes."
+              variables:
+                - { name: "invoiceAmount",      type: "NUMBER", source: "EVALUATION_INPUT", required: true }
+                - { name: "approvedSpendLimit", type: "NUMBER", source: "EVALUATION_INPUT", required: true }
+                - { name: "vendorRiskScore",    type: "NUMBER", source: "EVALUATION_INPUT", required: false }
+              possibleOutcomes: ["Success", "AttentionRequired", "Escalate", "Failed"]
+      responses:
+        "201":
+          description: Policy Definition created in DRAFT at version 1.0.0
+          headers:
+            Location:
+              description: URI of the created Definition
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyDefinitionResponse' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "422": { $ref: '#/components/responses/ValidationError' }
+
+  # ── Policy Definitions — Item ───────────────────────────────────────────────
+
+  /policy-definitions/{definitionId}:
+    parameters:
+      - $ref: '#/components/parameters/definitionIdPath'
+
+    get:
+      operationId: getPolicyDefinition
+      summary: Get a Policy Definition
+      description: Returns one Policy Definition, including its usage pills.
+      tags: [PolicyDefinitions]
+      responses:
+        "200":
+          description: Policy Definition returned
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyDefinitionResponse' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "404": { $ref: '#/components/responses/NotFound' }
+
+    put:
+      operationId: upsertPolicyDefinition
+      summary: Idempotent upsert of a Policy Definition by caller-supplied id
+      description: |
+        Creates the Definition under `{definitionId}` if absent, or updates it if it
+        exists. An unchanged payload is a **no-op** — no version is created. A payload
+        that changes `variables`, `condition`, or `possibleOutcomes` bumps the minor
+        version and writes a new immutable version snapshot.
+
+        First-time authoring may `POST /policy-definitions` to obtain a minted id, then
+        `PUT {id}` on every subsequent save.
+
+        Existing Policy Configurations are unaffected: each pins the Definition version
+        it was authored against, so a later Definition edit never retroactively changes
+        an existing Configuration.
+      tags: [PolicyDefinitions]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PolicyDefinitionUpsert' }
+      responses:
+        "200":
+          description: Existing Definition updated (or unchanged — no-op)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyDefinitionResponse' }
+        "201":
+          description: Definition created under the caller-supplied id
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyDefinitionResponse' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "422": { $ref: '#/components/responses/ValidationError' }
+
+    patch:
+      operationId: patchPolicyDefinition
+      summary: Partially update a Policy Definition
+      description: |
+        Merge-patch update. Changing `variables`, `condition`, or `possibleOutcomes`
+        creates a new immutable Definition version; changing only `name` or
+        `description` does not.
+
+        **Narrowing `possibleOutcomes` is validated against live usage:** removing an
+        outcome that a pinned Configuration still produces is rejected with `422`.
+      tags: [PolicyDefinitions]
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema: { $ref: '#/components/schemas/PolicyDefinitionPatch' }
+            example:
+              description: "Adds vendor-risk input to the invoice approval shape."
+      responses:
+        "200":
+          description: Policy Definition updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyDefinitionResponse' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "422": { $ref: '#/components/responses/ValidationError' }
+
+  /policy-definitions/{definitionId}/status:
+    parameters:
+      - $ref: '#/components/parameters/definitionIdPath'
+    patch:
+      operationId: updatePolicyDefinitionStatus
+      summary: Transition Policy Definition lifecycle status
+      description: |
+        Transitions a Definition through its lifecycle:
+
+        ```
+        DRAFT ──▶ ACTIVE ──▶ INACTIVE ──▶ ACTIVE (reactivate)
+                     └──▶ DEPRECATED  (superseded; read-only)
+                     └──▶ DISABLED    (administrative hold)
+        ```
+
+        A Definition must be `ACTIVE` before Policy Configurations can be authored
+        against it. Deactivating a Definition does **not** stop evaluation of
+        Configurations already pinned to one of its versions.
+      tags: [PolicyDefinitions]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StatusUpdateRequest' }
+            example:
+              status: "ACTIVE"
+              reason: "Reviewed and approved for tenant configuration."
+      responses:
+        "200":
+          description: Status transitioned
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyDefinitionResponse' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "409": { $ref: '#/components/responses/Conflict' }
+
+  /policy-definitions/{definitionId}/versions:
+    parameters:
+      - $ref: '#/components/parameters/definitionIdPath'
+    get:
+      operationId: listPolicyDefinitionVersions
+      summary: List Policy Definition version history
+      description: |
+        Returns the append-only, immutable version history of a Definition. Each record
+        snapshots the `variables`, `condition`, and `possibleOutcomes` that were current
+        at that version.
+      tags: [PolicyDefinitions]
+      parameters:
+        - $ref: '#/components/parameters/pageSizeParam'
+        - $ref: '#/components/parameters/pageStartIndexParam'
+      responses:
+        "200":
+          description: Version history returned
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyDefinitionVersionListResponse' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "404": { $ref: '#/components/responses/NotFound' }
+
+  /policy-definitions/{definitionId}/policies:
+    parameters:
+      - $ref: '#/components/parameters/definitionIdPath'
+    get:
+      operationId: listPolicyConfigurationsForDefinition
+      summary: List Policy Configurations authored against a Definition
+      description: |
+        Returns every Policy Configuration the calling tenant has authored against this
+        Definition — the detail behind the Definition's `appliedToWorkflows` usage pill.
+      tags: [PolicyDefinitions]
+      parameters:
+        - $ref: '#/components/parameters/pageSizeParam'
+        - $ref: '#/components/parameters/pageStartIndexParam'
+      responses:
+        "200":
+          description: Policy Configurations returned
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyConfigurationListResponse' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "404": { $ref: '#/components/responses/NotFound' }
+
+  # ── Policy Configurations ───────────────────────────────────────────────────
+
+  /policy-configurations:
+    get:
+      operationId: listPolicyConfigurations
+      summary: List / filter Policy Configurations
+      description: |
+        Returns the calling tenant's Policy Configurations, filterable by node
+        placement or by the Definition they configure. The tenant is always taken from
+        the authenticated principal — never from a query parameter.
+      tags: [PolicyConfigurations]
+      parameters:
+        - $ref: '#/components/parameters/nodeIdFilter'
+        - $ref: '#/components/parameters/workflowConfigIdFilter'
+        - $ref: '#/components/parameters/policyDefinitionIdFilter'
+        - $ref: '#/components/parameters/blueprintIdFilter'
+        - $ref: '#/components/parameters/pageSizeParam'
+        - $ref: '#/components/parameters/pageStartIndexParam'
+      responses:
+        "200":
+          description: Policy Configurations returned
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyConfigurationListResponse' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+
+  /policy-configurations/{nodeId}/{workflowConfigId}:
+    parameters:
+      - $ref: '#/components/parameters/nodeIdPath'
+      - $ref: '#/components/parameters/workflowConfigIdPath'
+
+    get:
+      operationId: getPolicyConfigurationAtNode
+      summary: Get the Policy Configuration at a node placement
+      description: |
+        Returns the calling tenant's Policy Configuration for one
+        `(nodeId, workflowConfigId)` placement.
+      tags: [PolicyConfigurations]
+      responses:
+        "200":
+          description: Policy Configuration returned
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyConfigurationResponse' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "404": { $ref: '#/components/responses/NotFound' }
+
+    put:
+      operationId: upsertPolicyConfiguration
+      summary: Idempotent upsert of the Policy Configuration at a node placement
+      description: |
+        Creates or version-bumps the calling tenant's Policy Configuration for one
+        `(nodeId, workflowConfigId)` placement. Re-`PUT` is idempotent: an unchanged
+        payload is a **no-op**; a changed payload bumps the minor version and writes a
+        new immutable snapshot.
+
+        Returns a server-minted `configurationId` (`cfg_<uuid>`) that the caller stores
+        in the workflow run configuration and may pass back on evaluate to load the
+        Configuration directly by id.
+
+        **Validation against the pinned Definition version:**
+
+        - every variable referenced by `condition` must be declared on the pinned
+          Definition version, matched on `name` + `type` + `source`
+        - every outcome referenced by `enforcement` (`outcome`, each value in
+          `outcomes`, and `defaultOutcome`) must be a member of that version's
+          `possibleOutcomes`
+        - for `kind: TIERED`, the tier names in `condition.subConditions` and the keys
+          of `enforcement.outcomes` must correspond one-to-one
+
+        If `policyDefinitionVersion` is omitted, the Definition's current version is
+        pinned. The pin is permanent for the life of the Configuration.
+      tags: [PolicyConfigurations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PolicyConfigurationUpsert' }
+            examples:
+              simple:
+                summary: SIMPLE enforcement — one condition, met / not met
+                value:
+                  blueprintId: "wf-invoice-approval-v1"
+                  policyDefinitionId: "def-invoice-approval"
+                  policyDefinitionVersion: 1
+                  condition:
+                    expression: "invoiceAmount > approvedSpendLimit"
+                    variables:
+                      - { name: "invoiceAmount",      type: "NUMBER", source: "EVALUATION_INPUT" }
+                      - { name: "approvedSpendLimit", type: "NUMBER", source: "EVALUATION_INPUT" }
+                  enforcement:
+                    kind: "SIMPLE"
+                    outcome: "Escalate"
+                    defaultOutcome: "Success"
+              tiered:
+                summary: TIERED enforcement — named tiers, first match wins
+                value:
+                  blueprintId: "wf-invoice-approval-v1"
+                  policyDefinitionId: "def-invoice-approval"
+                  condition:
+                    combinator: "OR"
+                    subConditions:
+                      - name: "high"
+                        expression: "invoiceAmount > 50000.0"
+                        variables: [ { name: "invoiceAmount", type: "NUMBER", source: "EVALUATION_INPUT" } ]
+                      - name: "medium"
+                        expression: "invoiceAmount > 10000.0"
+                        variables: [ { name: "invoiceAmount", type: "NUMBER", source: "EVALUATION_INPUT" } ]
+                  enforcement:
+                    kind: "TIERED"
+                    outcomes:
+                      high: "Failed"
+                      medium: "Escalate"
+                    defaultOutcome: "Success"
+      responses:
+        "200":
+          description: Existing Configuration version-bumped (or unchanged — no-op)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyConfigurationResponse' }
+        "201":
+          description: Policy Configuration created at version 1.0.0
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyConfigurationResponse' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "404":
+          description: "404 — referenced Policy Definition (or pinned version) not found"
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ProblemDetails' }
+        "422": { $ref: '#/components/responses/ValidationError' }
+
+  /policy-configurations/{configurationId}/versions:
+    parameters:
+      - $ref: '#/components/parameters/configurationIdPath'
+    get:
+      operationId: listPolicyConfigurationVersions
+      summary: List Policy Configuration version history
+      description: |
+        Returns the append-only, immutable version history of one Policy Configuration.
+        Each record snapshots the `condition` and `enforcement` at that version and
+        records the Definition version that was pinned at the time.
+      tags: [PolicyConfigurations]
+      parameters:
+        - $ref: '#/components/parameters/pageSizeParam'
+        - $ref: '#/components/parameters/pageStartIndexParam'
+      responses:
+        "200":
+          description: Version history returned
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyConfigurationVersionListResponse' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "404": { $ref: '#/components/responses/NotFound' }
+
+  # ── Evaluation ──────────────────────────────────────────────────────────────
+
+  /policies/{policyDefinitionId}/evaluate:
+    parameters:
+      - $ref: '#/components/parameters/policyDefinitionIdPath'
+    post:
+      operationId: evaluatePolicy
+      summary: Evaluate the tenant's Policy Configuration for a workflow node
+      description: |
+        The primary runtime endpoint — called by the FinOS Workflows Engine when it
+        executes a `FinOSPolicy` node. The path id is the **Policy Definition id**.
+
+        **Configuration resolution:**
+
+        1. When `policyConfigurationId` is supplied, the Configuration is loaded
+           directly by id.
+        2. Otherwise resolution falls back to the `(workflowConfigId, nodeId)` node
+           tuple for the calling tenant.
+
+        The loaded Configuration's `policyDefinitionId` **MUST** match the
+        `{policyDefinitionId}` in the path, or the call fails closed.
+
+        **Evaluation:**
+
+        Each variable's raw value is resolved from `evaluationInputs` and **coerced**
+        to its declared type before the expression runs. Coercion is strict and
+        fail-closed — it never silently truncates, widens with loss, or guesses.
+        `CONFIGURATION_INPUT` operands are baked into the saved condition as literals
+        and carry no runtime value; a stray `CONFIGURATION_INPUT` operand at evaluate
+        time fails closed.
+
+        For `kind: SIMPLE`, the outcome is `enforcement.outcome` when the condition is
+        met and `enforcement.defaultOutcome` otherwise. For `kind: TIERED`, tiers are
+        evaluated in order and the outcome mapped to the **first** matching tier wins;
+        lower-priority tiers are never reported even if they would also match.
+
+        **Fail-closed.** A missing Configuration, a Definition-id mismatch, a condition
+        that fails to compile, a coercion failure, or an evaluator runtime error all
+        return `200` with a deterministic `outcome: "Failed" / action: "BLOCK"`
+        envelope and the cause in `reason` — never a `5xx`.
+      tags: [Evaluation]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PolicyEvaluateRequest' }
+            example:
+              workflowInstanceId: "5281a21d-6ccd-4886-9675-678e36d66f32"
+              workflowId: "wf-invoice-approval-v1"
+              nodeId: "spending-policy"
+              evaluationInputs:
+                invoiceAmount: 75000.00
+                approvedSpendLimit: 50000.00
+                vendorRiskScore: 4.2
+      responses:
+        "200":
+          description: |
+            Evaluation completed. Includes deterministic fail-closed envelopes —
+            inspect `outcome` and `action` rather than the HTTP status.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyEvaluateResponse' }
+              example:
+                data:
+                  evaluationId: "eval-8f6d2b1df2ea4d29a720eee26e472b69"
+                  policyConfigurationId: "cfg_c6b766a2"
+                  policyDefinitionId: "def-invoice-approval"
+                  policyDefinitionVersion: 1
+                  policyVersion: "1.0.0"
+                  versionSource: "current-fallback"
+                  outcome: "Escalate"
+                  action: "ESCALATE"
+                  triggered: true
+                  reason: "Condition met: invoiceAmount > approvedSpendLimit → Escalate"
+                  enforcement: { kind: "SIMPLE" }
+                  coercedInputs: { invoiceAmount: 75000.0, approvedSpendLimit: 50000.0 }
+                  evaluationOutputs:
+                    matchedCondition:
+                      expression: "invoiceAmount > approvedSpendLimit"
+                      outcome: "Escalate"
+                    defaultOutcome: "Success"
+                  evaluatedAt: "2026-05-18T09:01:22Z"
+                meta:
+                  requestId: "req-xyz789"
+                  timestamp: "2026-05-18T09:01:22Z"
+                  apiVersion: "1.0"
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "422": { $ref: '#/components/responses/ValidationError' }
+
+  # ── Platform Invariants ─────────────────────────────────────────────────────
+
+  /invariants:
+    get:
+      operationId: listPlatformInvariants
+      summary: List active platform invariants (read-only)
+      description: |
+        > **Status: Planned — not yet implemented.**
+
+        Platform invariants are system-seeded, tenant-independent, cross-cutting
+        governance rules. They cannot be created, modified, or deleted via this API.
+        Once implemented they are evaluated on **every** evaluate call, before the
+        target Configuration; a firing invariant BLOCKs and overrides whatever the
+        Configuration would have decided.
+      tags: [PlatformInvariants]
+      parameters:
+        - $ref: '#/components/parameters/invariantStatusFilter'
+        - $ref: '#/components/parameters/pageSizeParam'
+        - $ref: '#/components/parameters/pageStartIndexParam'
+      responses:
+        "200":
+          description: Platform invariants returned
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FinOSPlatformInvariantListResponse' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+
+  /invariants/{invariantId}:
+    parameters:
+      - $ref: '#/components/parameters/invariantIdPath'
+    get:
+      operationId: getPlatformInvariant
+      summary: Get a platform invariant
+      description: |
+        > **Status: Planned — not yet implemented.**
+
+        Returns one system-seeded platform invariant.
+      tags: [PlatformInvariants]
+      responses:
+        "200":
+          description: Platform invariant returned
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FinOSPlatformInvariantResponse' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "404": { $ref: '#/components/responses/NotFound' }
+
+# =============================================================================
+# COMPONENTS
+# =============================================================================
+components:
+
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        OAuth 2.0 / OIDC JWT from the platform identity provider. The tenant is always
+        taken from the authenticated principal — never from a request body or query
+        string.
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-FinOS-API-Key
+      description: Service-to-service API key for machine clients
+
+  # ── Parameters ───────────────────────────────────────────────────────────────
+
+  parameters:
+
+    definitionIdPath:
+      name: definitionId
+      in: path
+      required: true
+      description: |
+        Identifier of the Policy Definition. Server-minted (`pol_<uuid>_v1`) when
+        created via `POST`, or caller-supplied when created via `PUT`.
+      schema:
+        type: string
+        example: "def-invoice-approval"
+
+    policyDefinitionIdPath:
+      name: policyDefinitionId
+      in: path
+      required: true
+      description: |
+        Identifier of the Policy Definition being evaluated. Matches
+        `FinOSPolicyNode.policyDefinitionId` in `finos-workflow-api.yaml`.
+      schema:
+        type: string
+        example: "def-invoice-approval"
+
+    configurationIdPath:
+      name: configurationId
+      in: path
+      required: true
+      description: Server-minted Policy Configuration identifier (`cfg_<uuid>`).
+      schema:
+        type: string
+        example: "cfg_c6b766a2"
+
+    nodeIdPath:
+      name: nodeId
+      in: path
+      required: true
+      description: |
+        DAG node identifier of the `FinOSPolicy` node this Configuration governs.
+      schema:
+        type: string
+        example: "spending-policy"
+
+    workflowConfigIdPath:
+      name: workflowConfigId
+      in: path
+      required: true
+      description: |
+        Identifier of the tenant's workflow configuration in which this node placement
+        lives. Together with `nodeId` it identifies one Configuration per tenant.
+      schema:
+        type: string
+        example: "wfc-invoice-approval-acme"
+
+    invariantIdPath:
+      name: invariantId
+      in: path
+      required: true
+      description: Identifier of a system-seeded platform invariant.
+      schema:
+        type: string
+        example: "INV-001"
+
+    statusFilter:
+      name: status
+      in: query
+      description: Filter by Definition lifecycle status.
+      schema: { $ref: '#/components/schemas/PolicyDefinitionStatus' }
+
+    invariantStatusFilter:
+      name: status
+      in: query
+      description: Filter by invariant status.
+      schema: { $ref: '#/components/schemas/InvariantStatus' }
+
+    filterParam:
+      name: filter
+      in: query
+      required: false
+      description: |
+        FinOS standard filter expression.
+        Syntax: `field operator "value"` optionally joined by `and`.
+        Operators: `contains` (case-insensitive substring), `eq` (exact equality).
+        Supported fields: `name`, `description`, `status`, `owner`, `category`.
+      schema: { type: string }
+      examples:
+        name_contains:
+          value: 'name contains "threshold"'
+        status_eq:
+          value: 'status eq "ACTIVE"'
+        compound:
+          value: 'owner eq "controllership" and status eq "ACTIVE"'
+
+    nodeIdFilter:
+      name: nodeId
+      in: query
+      description: Filter Configurations by DAG node identifier.
+      schema: { type: string }
+
+    workflowConfigIdFilter:
+      name: workflowConfigId
+      in: query
+      description: Filter Configurations by workflow configuration identifier.
+      schema: { type: string }
+
+    policyDefinitionIdFilter:
+      name: policyDefinitionId
+      in: query
+      description: Filter Configurations by the Definition they configure.
+      schema: { type: string }
+
+    blueprintIdFilter:
+      name: blueprintId
+      in: query
+      description: Filter Configurations by the workflow blueprint they belong to.
+      schema: { type: string }
+
+    sortParam:
+      name: sort
+      in: query
+      description: Sort field.
+      schema:
+        type: string
+        enum: [name, created, modified, status]
+        default: created
+
+    sortOrderParam:
+      name: sortOrder
+      in: query
+      description: Sort direction.
+      schema:
+        type: string
+        enum: [asc, desc]
+        default: asc
+
+    pageSizeParam:
+      name: pageSize
+      in: query
+      description: Number of results per page (1–100).
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 25
+
+    pageStartIndexParam:
+      name: pageStartIndex
+      in: query
+      description: Zero-based start index for pagination.
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      description: |
+        Unique key for safe retries. Resubmitting within 24 hours with the same
+        key returns the original response without creating a duplicate.
+      schema: { type: string }
+
+  # ── Responses ─────────────────────────────────────────────────────────────────
+
+  responses:
+
+    NotFound:
+      description: "404 — Definition, Configuration, version, or invariant not found"
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+
+    BadRequest:
+      description: "400 — Malformed request body or invalid query parameters"
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+
+    Unauthorized:
+      description: "401 — Missing or invalid authentication credentials"
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+
+    Forbidden:
+      description: "403 — Authenticated but insufficient scope for this resource"
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+
+    Conflict:
+      description: "409 — Invalid Definition status transition"
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+
+    ValidationError:
+      description: |
+        "422 — Validation failed: a condition references a variable not declared on the
+        pinned Definition version, an outcome outside its `possibleOutcomes`, a
+        tier-name/outcome-key mismatch, or a required input absent from
+        `evaluationInputs`."
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+
+  # ── Schemas ───────────────────────────────────────────────────────────────────
+
+  schemas:
+
+    # ── Enumerations ──────────────────────────────────────────────────────────
+
+    PolicyDefinitionStatus:
+      type: string
+      enum:
+        - DRAFT       # Under authoring; Configurations cannot be created against it
+        - ACTIVE      # Live; Configurations may be authored and evaluated
+        - INACTIVE    # Temporarily suspended; re-activatable
+        - DEPRECATED  # Superseded; read-only; data retained
+        - DISABLED    # Administrative hold
+      description: |
+        Lifecycle status of a Policy Definition. Policy Configurations have **no**
+        status lifecycle — they are always active and evolve only by version bump.
+
+    StandardOutcome:
+      type: string
+      enum:
+        - Success
+        - Escalate
+        - AttentionRequired
+        - Failed
+      description: |
+        The **standard** outcome vocabulary, aligned with `FinOSPolicyEvaluationOutcome`
+        in `finos-workflow-execution-history-openapi.yaml`.
+
+        The actual set of valid outcomes at any node is the pinned Definition version's
+        `possibleOutcomes`, which is a closed allow-list that **may** declare additional
+        custom labels (e.g. `NO_ITEMS`, `REQUIRE_HITL`). Outcome values on the wire are
+        therefore plain strings; this enum documents the standard set.
+
+        | Value | `triggered` | Typical `action` | Workflow routing |
+        |---|---|---|---|
+        | `Success` | `false` | — | Proceed to next node (auto-approve path) |
+        | `Escalate` | `true` | `ESCALATE` | Route to a `FinOSHITL` node |
+        | `AttentionRequired` | `true` | `ESCALATE` | Route to HITL or notify; may continue |
+        | `Failed` | `true` | `BLOCK` | Reject / terminal failure path |
+
+    FinOSPolicyEnforcementAction:
+      type: string
+      enum:
+        - BLOCK           # Hard block — prevent the action entirely
+        - ESCALATE        # Require human review via a FinOSHITL node
+        - REQUIRE_HITL    # Pause workflow; require FinOSHITL callback
+        - NOTIFY          # Send notification; allow action to continue
+        - LOG             # Audit log only; no workflow interference
+        - SOFT_BLOCK      # Advisory block; require explicit acknowledgement
+      description: |
+        Enforcement action derived from the produced outcome: `Failed → BLOCK`, any
+        other triggered outcome → `ESCALATE`, otherwise none.
+
+    EnforcementKind:
+      type: string
+      enum: [SIMPLE, TIERED]
+      description: |
+        Discriminator for the enforcement shape. `SIMPLE` — one condition, met / not
+        met. `TIERED` — the top-level condition is a combinator tree whose immediate
+        `subConditions` are the named tiers.
+
+    InvariantStatus:
+      type: string
+      enum: [ACTIVE, INACTIVE]
+      description: Lifecycle status of a platform invariant.
+
+    ConditionVariableType:
+      type: string
+      enum: [STRING, NUMBER, BOOLEAN, DATE, OBJECT, ARRAY]
+      description: |
+        The FinOS type set is deliberately coarser than a host language's native types —
+        six types cover the governance surface. At evaluate time each raw value is
+        coerced to its declared type; coercion is **strict and fail-closed**.
+
+        | `type` | Accepts (native) | Accepts (string form) | Coerced to | Notes |
+        |---|---|---|---|---|
+        | `NUMBER` | `int`, `float` | `"10"`, `"10.5"`, `"-3"`, `"1.2e3"` | float64 | One numeric type covers int, double, float, long. An integer beyond ±2⁵³ is **rejected** (precision loss) rather than rounded. |
+        | `STRING` | `str` | any string | string | Case sensitivity is configurable; comparisons are case-insensitive by default. |
+        | `BOOLEAN` | `bool` | `"true"` / `"false"` | bool | No truthy coercion of `1` / `0`. |
+        | `DATE` | ISO-8601 date-time | `"2026-01-31"`, `"2026-01-31T12:00:00Z"` | timestamp | `Z` is normalised to `+00:00`. |
+        | `OBJECT` | `dict` | JSON object string | map | A scalar or list fails. |
+        | `ARRAY` | `list` | JSON array string | list | A scalar or object fails. |
+
+    ConditionVariableSource:
+      type: string
+      enum:
+        - EVALUATION_INPUT     # Supplied in evaluationInputs on the evaluate call
+        - CONFIGURATION_INPUT  # Filled in by the tenant when authoring the Configuration
+      description: |
+        Where a variable's value comes from. A variable is only ever resolved from its
+        declared source.
+
+        | Source | Resolved from | Where the value comes from |
+        |---|---|---|
+        | `EVALUATION_INPUT` | `evaluationInputs` | Provided in the evaluate call at runtime |
+        | `CONFIGURATION_INPUT` | — (authoring time) | A value the tenant fills in when authoring the Configuration. It is baked into the saved condition as a literal and carries **no** runtime value — a stray `CONFIGURATION_INPUT` operand at evaluate time fails closed. |
+
+    # ── Condition & enforcement ───────────────────────────────────────────────
+
+    ConditionVariable:
+      type: object
+      required: [name, type, source]
+      description: |
+        Declares an input variable a condition expression may reference. A
+        Configuration's condition may reference **only** variables declared on the
+        pinned Definition version, matched on `name` + `type` + `source`.
+      properties:
+        name:
+          type: string
+          description: Variable name as used in the condition expression.
+          example: "invoiceAmount"
+        type: { $ref: '#/components/schemas/ConditionVariableType' }
+        source: { $ref: '#/components/schemas/ConditionVariableSource' }
+        description: { type: string }
+        required:
+          type: boolean
+          default: true
+          description: |
+            Whether this variable must be present in its source map. A required
+            variable missing from its source fails closed.
+        defaultValue:
+          description: "Default value used when the variable is absent and `required: false`."
+
+    PolicyCondition:
+      type: object
+      description: |
+        A condition tree. A **leaf** carries an `expression` and the `variables` it
+        references; a **branch** carries a `combinator` and `subConditions`.
+
+        Expressions are written in **CEL** (Common Expression Language):
+
+        - **Comparison**: `==`, `!=`, `<`, `<=`, `>`, `>=`
+        - **Logical**: `&&`, `||`, `!`
+        - **Arithmetic**: `+`, `-`, `*`, `/`, `%`
+        - **Membership / collections**: `in`, list/map indexing, `size()`
+        - **Strings**: `contains`, `startsWith`, `endsWith`, `matches` (regex);
+          case-insensitive comparison via the `strings` extension
+          (`status.lowerAscii() == 'open'`)
+        - **Objects**: field access and `in` for key membership. Accessing a missing key
+          raises `NOT_FOUND` and fails the evaluation closed — guard optional fields with
+          `in`.
+
+        `NUMBER` is an IEEE-754 double, so **equality on a computed sum of monetary
+        values is fragile** (`0.1 + 0.2 == 0.3` is `false`). For "sum equals total"
+        money checks, scale to integer units with the `math` extension:
+        `math.round(a*100.0) + math.round(b*100.0) == math.round(c*100.0)`.
+      properties:
+        name:
+          type: string
+          description: |
+            Tier name. Required — and unique — on each immediate `subConditions` entry
+            of a `TIERED` Configuration's top-level condition; these names are the keys
+            of `enforcement.outcomes`.
+          example: "high"
+        expression:
+          type: string
+          description: CEL expression evaluated against the coerced variable set.
+          example: "invoiceAmount > approvedSpendLimit"
+        variables:
+          type: array
+          items: { $ref: '#/components/schemas/ConditionVariable' }
+          description: Variable declarations referenced by `expression`.
+        combinator:
+          type: string
+          enum: [AND, OR]
+          default: AND
+          description: Logical combinator applied across `subConditions`.
+        subConditions:
+          type: array
+          items: { $ref: '#/components/schemas/PolicyCondition' }
+          description: Nested conditions for compound logic, or the tiers of a `TIERED` Configuration.
+
+    Enforcement:
+      description: |
+        Maps the condition's result to an outcome. Enforcement is a discriminated union
+        on `kind` and carries **only** the outcome mapping — the `condition` is a
+        sibling, top-level field on the Configuration, not nested here. This lets the
+        same condition tree carry per-clause audit attribution independent of the
+        outcome mapping.
+
+        Every outcome referenced here must be a member of the pinned Definition
+        version's `possibleOutcomes`, validated at save time.
+      oneOf:
+        - $ref: '#/components/schemas/SimpleEnforcement'
+        - $ref: '#/components/schemas/TieredEnforcement'
+      discriminator:
+        propertyName: kind
+        mapping:
+          SIMPLE: '#/components/schemas/SimpleEnforcement'
+          TIERED: '#/components/schemas/TieredEnforcement'
+
+    SimpleEnforcement:
+      type: object
+      required: [kind, outcome, defaultOutcome]
+      description: One condition, met or not met.
+      properties:
+        kind:
+          type: string
+          const: SIMPLE
+        outcome:
+          type: string
+          description: The outcome produced when the condition is met.
+          example: "Escalate"
+        defaultOutcome:
+          type: string
+          description: The outcome produced when the condition is not met.
+          example: "Success"
+
+    TieredEnforcement:
+      type: object
+      required: [kind, outcomes, defaultOutcome]
+      description: |
+        Named tiers, evaluated in the order they appear in `condition.subConditions`.
+        The outcome mapped to the **first** matching tier wins; lower-priority tiers
+        are never reported even if they would also match.
+      properties:
+        kind:
+          type: string
+          const: TIERED
+        outcomes:
+          type: object
+          additionalProperties: { type: string }
+          description: |
+            Map from tier name to outcome. Keys must correspond one-to-one with the
+            `name` of each immediate entry in `condition.subConditions`.
+          example:
+            high: "Failed"
+            medium: "Escalate"
+        defaultOutcome:
+          type: string
+          description: The outcome produced when no tier matched.
+          example: "Success"
+
+    # ── Policy Definition ─────────────────────────────────────────────────────
+
+    PolicyDefinition:
+      type: object
+      description: |
+        A tenant-agnostic, versioned governance *shape* — a declared variable catalog
+        and a closed allow-list of possible outcomes. Carries no condition, no
+        enforcement, and no tenant.
+      required:
+        - definitionId
+        - name
+        - possibleOutcomes
+        - currentVersion
+        - status
+        - createdBy
+        - createdAt
+      properties:
+        definitionId:
+          type: string
+          description: Unique identifier. Server-minted (`pol_<uuid>_v1`) or caller-supplied.
+          example: "def-invoice-approval"
+        name:
+          type: string
+          example: "Invoice Approval Gate"
+        description:
+          type: string
+        variables:
+          type: array
+          items: { $ref: '#/components/schemas/ConditionVariable' }
+          description: |
+            The declared variable catalog a Configuration's condition may reference.
+            Derived from `condition`'s leaves when a Definition-level condition is
+            present; declared directly otherwise. **Changing this creates a new version.**
+        condition:
+          $ref: '#/components/schemas/PolicyCondition'
+          description: |
+            **Optional.** When present, `variables` is derived from its leaves and the
+            condition may reference `CONFIGURATION_INPUT` operands that a tenant fills in
+            when authoring its Configuration. **Changing this creates a new version.**
+        possibleOutcomes:
+          type: array
+          items: { type: string }
+          minItems: 1
+          description: |
+            **Closed allow-list** of outcome labels a Configuration may produce. Every
+            outcome a Configuration references — in any tier or as a default — must be a
+            member of the pinned version's list. **Changing this creates a new version.**
+          example: ["Success", "AttentionRequired", "Escalate", "Failed"]
+        currentVersion:
+          type: string
+          description: Semantic version of the Definition.
+          example: "1.0.0"
+        status: { $ref: '#/components/schemas/PolicyDefinitionStatus' }
+        availableToBlueprints:
+          type: integer
+          readOnly: true
+          description: |
+            Usage pill — count of distinct workflow definitions whose `FinOSPolicy` node
+            references this Definition.
+        appliedToWorkflows:
+          type: integer
+          readOnly: true
+          description: |
+            Usage pill — count of distinct workflows for which a tenant has authored a
+            Policy Configuration against this Definition.
+        createdBy: { type: string }
+        createdAt: { type: string, format: date-time }
+        lastModifiedBy: { type: string }
+        lastModifiedAt: { type: string, format: date-time }
+
+    PolicyDefinitionCreate:
+      type: object
+      required: [name, possibleOutcomes]
+      description: |
+        Create payload for `POST /policy-definitions`. The identifier, version, and
+        status are server-assigned.
+      properties:
+        name: { type: string }
+        description: { type: string }
+        variables:
+          type: array
+          items: { $ref: '#/components/schemas/ConditionVariable' }
+        condition: { $ref: '#/components/schemas/PolicyCondition' }
+        possibleOutcomes:
+          type: array
+          items: { type: string }
+          minItems: 1
+
+    PolicyDefinitionUpsert:
+      type: object
+      required: [name, possibleOutcomes]
+      description: |
+        Full representation for `PUT /policy-definitions/{definitionId}`. An unchanged
+        payload is a no-op; a change to `variables`, `condition`, or `possibleOutcomes`
+        bumps the minor version.
+      properties:
+        name: { type: string }
+        description: { type: string }
+        variables:
+          type: array
+          items: { $ref: '#/components/schemas/ConditionVariable' }
+        condition: { $ref: '#/components/schemas/PolicyCondition' }
+        possibleOutcomes:
+          type: array
+          items: { type: string }
+          minItems: 1
+        changeDescription:
+          type: string
+          description: Optional note recorded on the version snapshot.
+
+    PolicyDefinitionPatch:
+      type: object
+      description: |
+        Merge-patch payload — include only the fields to change. Changing `variables`,
+        `condition`, or `possibleOutcomes` creates a new version.
+      properties:
+        name: { type: string }
+        description: { type: string }
+        variables:
+          type: array
+          items: { $ref: '#/components/schemas/ConditionVariable' }
+        condition: { $ref: '#/components/schemas/PolicyCondition' }
+        possibleOutcomes:
+          type: array
+          items: { type: string }
+          minItems: 1
+        changeDescription: { type: string }
+
+    PolicyDefinitionVersion:
+      type: object
+      description: Immutable snapshot of a Policy Definition at one version.
+      required: [versionId, definitionId, versionNumber, createdAt]
+      properties:
+        versionId: { type: string, format: uuid }
+        definitionId: { type: string }
+        versionNumber:
+          type: string
+          example: "1.0.0"
+        variables:
+          type: array
+          items: { $ref: '#/components/schemas/ConditionVariable' }
+        condition: { $ref: '#/components/schemas/PolicyCondition' }
+        possibleOutcomes:
+          type: array
+          items: { type: string }
+        changeDescription: { type: string }
+        createdBy: { type: string }
+        createdAt: { type: string, format: date-time }
+
+    # ── Policy Configuration ──────────────────────────────────────────────────
+
+    PolicyConfiguration:
+      type: object
+      description: |
+        The concrete, tenant-owned rule at a single workflow node placement. Identified
+        by `(tenantId, workflowConfigId, nodeId)` and carrying the actual `condition`
+        and `enforcement`.
+
+        A Configuration has **no** `status`, `scope`, `enabled`, `overridable`, or
+        standalone `possibleOutcomes` field — it is always active, already scoped to one
+        node, and its outcome vocabulary is owned by the pinned Definition version.
+      required:
+        - configurationId
+        - tenantId
+        - nodeId
+        - workflowConfigId
+        - policyDefinitionId
+        - policyDefinitionVersion
+        - condition
+        - enforcement
+        - currentVersion
+        - createdBy
+        - createdAt
+      properties:
+        configurationId:
+          type: string
+          description: Server-minted identifier (`cfg_<uuid>`).
+          example: "cfg_c6b766a2"
+        tenantId:
+          type: string
+          description: Owning tenant, taken from the authenticated principal.
+        blueprintId:
+          type: string
+          description: The workflow blueprint this node placement belongs to.
+          example: "wf-invoice-approval-v1"
+        workflowConfigId:
+          type: string
+          description: The tenant's workflow configuration containing this node placement.
+          example: "wfc-invoice-approval-acme"
+        workflowConfigName:
+          type: string
+        nodeId:
+          type: string
+          description: The `FinOSPolicy` node this Configuration governs.
+          example: "spending-policy"
+        policyDefinitionId:
+          type: string
+          description: The Definition this Configuration configures.
+        policyDefinitionVersion:
+          type: integer
+          description: |
+            The Definition version pinned at save time. **Immutable** for the life of the
+            Configuration — a Definition edit after authoring never affects it.
+        condition:
+          $ref: '#/components/schemas/PolicyCondition'
+          description: |
+            **Top-level** condition tree — a sibling of `enforcement`, not nested inside
+            it. **Changing this creates a new version.**
+        enforcement:
+          $ref: '#/components/schemas/Enforcement'
+          description: Outcome mapping only. **Changing this creates a new version.**
+        currentVersion:
+          type: string
+          description: This Configuration's own version.
+          example: "2.0.0"
+        createdBy: { type: string }
+        createdAt: { type: string, format: date-time }
+        lastModifiedBy: { type: string }
+        lastModifiedAt: { type: string, format: date-time }
+
+    PolicyConfigurationUpsert:
+      type: object
+      required: [policyDefinitionId, condition, enforcement]
+      description: |
+        Upsert payload for `PUT /policy-configurations/{nodeId}/{workflowConfigId}`.
+        The tenant, node, and workflow configuration come from the authenticated
+        principal and the path.
+      properties:
+        blueprintId:
+          type: string
+          description: The workflow blueprint this node placement belongs to.
+        policyDefinitionId:
+          type: string
+          description: The Definition being configured.
+        policyDefinitionVersion:
+          type: integer
+          description: |
+            Definition version to pin. Omit to pin the Definition's current version.
+            The pin is permanent for the life of the Configuration.
+        condition: { $ref: '#/components/schemas/PolicyCondition' }
+        enforcement: { $ref: '#/components/schemas/Enforcement' }
+        workflowConfigName: { type: string }
+        changeDescription:
+          type: string
+          description: Optional note recorded on the version snapshot.
+
+    PolicyConfigurationVersion:
+      type: object
+      description: Immutable snapshot of a Policy Configuration at one version.
+      required: [versionId, configurationId, versionNumber, createdAt]
+      properties:
+        versionId: { type: string, format: uuid }
+        configurationId: { type: string }
+        versionNumber:
+          type: string
+          example: "1.0.0"
+        policyDefinitionId: { type: string }
+        policyDefinitionVersion:
+          type: integer
+          description: The Definition version pinned at the time this snapshot was written.
+        condition: { $ref: '#/components/schemas/PolicyCondition' }
+        enforcement: { $ref: '#/components/schemas/Enforcement' }
+        changeDescription: { type: string }
+        createdBy: { type: string }
+        createdAt: { type: string, format: date-time }
+
+    # ── Evaluation ────────────────────────────────────────────────────────────
+
+    PolicyEvaluateRequest:
+      type: object
+      required: [workflowId, nodeId, workflowInstanceId, evaluationInputs]
+      description: |
+        Request body for `POST /policies/{policyDefinitionId}/evaluate`. Carries the
+        runtime inputs evaluated against the resolved Configuration's condition.
+      properties:
+        workflowInstanceId:
+          type: string
+          format: uuid
+          description: Identifier of the calling FinOSWorkflow execution instance.
+        workflowId:
+          type: string
+          description: Identifier of the calling workflow definition.
+          example: "wf-invoice-approval-v1"
+        nodeId:
+          type: string
+          description: DAG node identifier of the calling `FinOSPolicy` node.
+          example: "spending-policy"
+        workflowConfigId:
+          type: string
+          description: |
+            The tenant's workflow configuration for this run. Used with `nodeId` to
+            resolve the Configuration when `policyConfigurationId` is not supplied.
+        policyConfigurationId:
+          type: string
+          description: |
+            Loads the Configuration directly by id, bypassing `(workflowConfigId, nodeId)`
+            tuple resolution. The loaded Configuration's `policyDefinitionId` must match
+            the `{policyDefinitionId}` in the path or the call fails closed.
+          example: "cfg_c6b766a2"
+        evaluationInputs:
+          type: object
+          additionalProperties: true
+          description: |
+            Key-value map of runtime inputs. Keys must match variables declared with
+            source `EVALUATION_INPUT` on the pinned Definition version.
+          example:
+            invoiceAmount: 75000.00
+            approvedSpendLimit: 50000.00
+            vendorRiskScore: 4.2
+        workflowContext:
+          type: object
+          additionalProperties: true
+          description: |
+            Optional caller context recorded in the evaluation's `contextSnapshot`.
+            **Not** a variable source — only `EVALUATION_INPUT` variables are resolvable
+            at runtime.
+        agentOutput:
+          type: object
+          additionalProperties: true
+          description: |
+            Optional upstream `FinOSAgent` output recorded in `contextSnapshot`. Not a
+            variable source.
+        systemContext:
+          type: object
+          additionalProperties: true
+          description: |
+            Optional service-supplied context recorded in `contextSnapshot`. Not a
+            variable source.
+
+    PolicyEvaluateResult:
+      type: object
+      description: |
+        Result of a policy evaluation. `outcome` is the primary output consumed by the
+        calling workflow, where it becomes the `policy_outcome` variable that drives
+        outgoing edge conditions.
+      required:
+        - evaluationId
+        - policyDefinitionId
+        - outcome
+        - triggered
+        - evaluatedAt
+      properties:
+        evaluationId:
+          type: string
+          description: Unique identifier of this evaluation record.
+          example: "eval-8f6d2b1df2ea4d29a720eee26e472b69"
+        policyConfigurationId:
+          type: string
+          description: The Configuration that was evaluated. Absent on a fail-closed envelope where none resolved.
+        policyDefinitionId: { type: string }
+        policyDefinitionVersion:
+          type: integer
+          description: The Definition version pinned by the evaluated Configuration.
+        policyVersion:
+          type: string
+          description: The Configuration version that was evaluated.
+        versionSource:
+          type: string
+          description: How the evaluated version was selected (e.g. `pinned`, `current-fallback`).
+        outcome:
+          type: string
+          description: |
+            The produced outcome label, drawn from the pinned Definition version's
+            `possibleOutcomes`. Maps to the `policy_outcome` workflow variable. See
+            `StandardOutcome` for the standard vocabulary.
+          example: "Escalate"
+        action:
+          $ref: '#/components/schemas/FinOSPolicyEnforcementAction'
+          description: |
+            Enforcement action derived from the outcome: `Failed → BLOCK`, any other
+            triggered outcome → `ESCALATE`, otherwise absent.
+        triggered:
+          type: boolean
+          description: "`true` whenever the produced `outcome` differs from `defaultOutcome`."
+        reason:
+          type: string
+          description: Human-readable explanation of the outcome, including the fail-closed cause.
+          example: "Condition met: invoiceAmount > approvedSpendLimit → Escalate"
+        enforcement:
+          type: object
+          properties:
+            kind: { $ref: '#/components/schemas/EnforcementKind' }
+          description: The shape of the enforcement that produced this outcome.
+        coercedInputs:
+          type: object
+          additionalProperties: true
+          description: The evaluation inputs after strict type coercion.
+        evaluationOutputs:
+          type: object
+          description: |
+            Detail of what fired. `matchedCondition` is `null` when nothing fired, in
+            which case `outcome` equals `defaultOutcome`. For a `TIERED` Configuration,
+            `matchedCondition` additionally carries `tierIndex` — the zero-based index of
+            the tier that fired.
+          properties:
+            matchedCondition:
+              type: [object, "null"]
+              additionalProperties: true
+              properties:
+                name: { type: string }
+                expression: { type: string }
+                outcome: { type: string }
+                tierIndex: { type: integer }
+            defaultOutcome: { type: string }
+        evaluatedAt: { type: string, format: date-time }
+
+    PolicyEvaluation:
+      type: object
+      description: |
+        Persisted record of a single evaluation. One is written per evaluate call,
+        including fail-closed envelopes.
+      required: [evaluationId, tenantId, policyDefinitionId, triggered, evaluatedAt]
+      properties:
+        evaluationId: { type: string }
+        tenantId: { type: string }
+        workflowId: { type: string }
+        workflowInstanceId: { type: string, format: uuid }
+        nodeId: { type: string }
+        policyConfigurationId: { type: string }
+        policyDefinitionId: { type: string }
+        policyDefinitionVersion: { type: integer }
+        policyVersion: { type: string }
+        relatedEventId:
+          type: string
+          format: uuid
+          description: |
+            Identifier of the `FinOSPolicyEventVertex` in
+            `FinOSWorkflowExecutionHistory` that records this evaluation.
+        triggered: { type: boolean }
+        action: { $ref: '#/components/schemas/FinOSPolicyEnforcementAction' }
+        outcome: { type: string }
+        contextSnapshot:
+          type: object
+          additionalProperties: true
+          description: Snapshot of the evaluate call's input maps.
+        reason: { type: string }
+        evaluatedAt: { type: string, format: date-time }
+
+    # ── Platform Invariant ────────────────────────────────────────────────────
+
+    FinOSPlatformInvariant:
+      type: object
+      description: |
+        > **Status: Planned — not yet implemented.**
+
+        A system-seeded, tenant-independent, cross-cutting governance rule. Invariants
+        cannot be created, modified, or deleted via this API.
+
+        | Characteristic | Policy Configuration | Platform Invariant |
+        |---|---|---|
+        | Authored by | Tenants | Platform only (system-seeded) |
+        | Tenant-scoped | Yes | No (platform-wide) |
+        | Mutable via API | Yes (versioned) | No (read-only) |
+        | Bound to a node | Yes (`workflowConfigId`, `nodeId`) | No (cross-cutting) |
+        | Evaluated | On its node's evaluate call | On **every** evaluate call, before the target Configuration |
+      required: [invariantId, name, status]
+      properties:
+        invariantId:
+          type: string
+          example: "INV-001"
+        name:
+          type: string
+          example: "AI agents must not mutate systems of record"
+        description: { type: string }
+        rationale: { type: string }
+        status: { $ref: '#/components/schemas/InvariantStatus' }
+        action: { $ref: '#/components/schemas/FinOSPolicyEnforcementAction' }
+        appliesTo:
+          type: array
+          items: { type: string }
+          description: Node types, agent types, or surfaces this invariant constrains.
+          example: ["FinOSAgent"]
+        seededAt: { type: string, format: date-time }
+
+    # ── Envelope & shared ─────────────────────────────────────────────────────
+
+    Meta:
+      type: object
+      properties:
+        requestId: { type: string }
+        timestamp: { type: string, format: date-time }
+        apiVersion: { type: string, example: "1.0" }
+
+    PaginationMeta:
+      type: object
+      description: Pagination metadata using the FinOS zero-based offset pattern.
+      properties:
+        pageSize: { type: integer }
+        pageStartIndex: { type: integer }
+        totalCount: { type: integer }
+        hasNext: { type: boolean }
+        hasPrev: { type: boolean }
+
+    ListMeta:
+      description: Response envelope metadata for paginated list responses.
+      allOf:
+        - $ref: '#/components/schemas/Meta'
+        - type: object
+          properties:
+            pagination: { $ref: '#/components/schemas/PaginationMeta' }
+
+    StatusUpdateRequest:
+      type: object
+      required: [status]
+      properties:
+        status: { $ref: '#/components/schemas/PolicyDefinitionStatus' }
+        reason:
+          type: string
+          description: Audit note recorded with the transition.
+
+    PolicyDefinitionResponse:
+      type: object
+      required: [data]
+      properties:
+        data: { $ref: '#/components/schemas/PolicyDefinition' }
+        meta: { $ref: '#/components/schemas/Meta' }
+
+    PolicyDefinitionListResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/PolicyDefinition' }
+        meta: { $ref: '#/components/schemas/ListMeta' }
+
+    PolicyDefinitionVersionListResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/PolicyDefinitionVersion' }
+        meta: { $ref: '#/components/schemas/ListMeta' }
+
+    PolicyConfigurationResponse:
+      type: object
+      required: [data]
+      properties:
+        data: { $ref: '#/components/schemas/PolicyConfiguration' }
+        meta: { $ref: '#/components/schemas/Meta' }
+
+    PolicyConfigurationListResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/PolicyConfiguration' }
+        meta: { $ref: '#/components/schemas/ListMeta' }
+
+    PolicyConfigurationVersionListResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/PolicyConfigurationVersion' }
+        meta: { $ref: '#/components/schemas/ListMeta' }
+
+    PolicyEvaluateResponse:
+      type: object
+      required: [data]
+      properties:
+        data: { $ref: '#/components/schemas/PolicyEvaluateResult' }
+        meta: { $ref: '#/components/schemas/Meta' }
+
+    PolicyEvaluationListResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/PolicyEvaluation' }
+        meta: { $ref: '#/components/schemas/ListMeta' }
+
+    FinOSPlatformInvariantResponse:
+      type: object
+      required: [data]
+      properties:
+        data: { $ref: '#/components/schemas/FinOSPlatformInvariant' }
+        meta: { $ref: '#/components/schemas/Meta' }
+
+    FinOSPlatformInvariantListResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/FinOSPlatformInvariant' }
+        meta: { $ref: '#/components/schemas/ListMeta' }
+
+    HealthResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded, unhealthy]
+        service:
+          type: string
+          example: "finos-policy-service"
+        version: { type: string }
+        checks:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              status:
+                type: string
+                enum: [ok, degraded, unhealthy]
+              detail: { type: string }
+              latencyMs: { type: number }
+        timestamp: { type: string, format: date-time }
+
+    ProblemDetails:
+      type: object
+      description: RFC 9457 Problem Details for HTTP APIs.
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          format: uri
+          example: "https://api.example.com/finos-policy-service/errors/validation-failed"
+        title:
+          type: string
+          example: "Policy Validation Failed"
+        status:
+          type: integer
+          example: 422
+        detail:
+          type: string
+          example: "Outcome 'RequiresApproval' is not in the pinned Definition version's allowed list: [AttentionRequired, Escalate, Failed, Success]."
+        instance: { type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              code: { type: string }
+              message: { type: string }

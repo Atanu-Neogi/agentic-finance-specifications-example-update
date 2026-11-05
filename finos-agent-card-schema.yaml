@@ -1,0 +1,2570 @@
+openapi: 3.1.0
+
+info:
+  title: Blackline FinOS Agent Card Schema
+  version: 1.0.0
+  description: |
+    **FinOS Agent Card** — the A2A-native discovery and invocation schema for
+    Blackline FinOS AI Agents. Conforms to the
+    [Agent-to-Agent (A2A) protocol](https://a2a-protocol.org/latest/specification/).
+
+    ## Architecture Overview
+
+    ```
+    Caller (WorkflowEngine | Agent | Service | Human)
+      │
+      │  GET  /.well-known/agent-card.json  ← A2A discovery
+      │  POST /message:send                 ← A2A message delivery (HTTP binding)
+      │        body: A2A Message
+      │        Message.metadata.finos.*     ← FinOS governance metadata
+      ▼
+    FinOS Agent (A2A-compatible)
+      │  reads:  Message.metadata.finos.callingContext
+      │          Message.metadata.finos.contextGraphs
+      │          Message.metadata.finos.policies
+      │          Message.metadata.finos.variables
+      │          Message.metadata.finos.sessionStore
+      │
+      │  emits:  A2A Task state transitions
+      │          FinOSAgentEventVertex (CloudEvent outcome)
+      │          → posted to FinOSWorkflowExecutionHistory DAG
+      ▼
+    FinOSAgentEventVertex (CloudEvent-compliant)
+    ```
+
+    ## A2A Conformance
+
+    The `FinOSAgentCard` is the A2A Agent Card served at `/.well-known/agent-card.json`.
+    It extends the standard A2A fields with FinOS-specific metadata carried in
+    `capabilities.extensions[]` under URI `https://{vendor-domain}/finos/agent-card/v1`.
+
+    All invocation-time FinOS governance data (calling context, context graphs,
+    policies, variables, session store) is carried in A2A `Message.metadata.finos.*`
+    — no custom invocation envelope is used.
+
+    ## Context Graph Modes
+
+    | Mode | Description |
+    |---|---|
+    | `RAG_QUERY` | Agent issues a query at runtime against a vector store |
+    | `RAG_TENSOR` | Pre-tokenized embedding matrix injected directly as context |
+    | `FINOSWORKFLOW_GRAPH` | Subgraph of a FinOSWorkflowExecutionHistory as context |
+    | `STRUCTURED_CHUNKS` | Pre-fetched, chunked text documents as context |
+
+    ## A2A Headers
+
+    | Header | Purpose |
+    |---|---|
+    | `A2A-Version` | Protocol version negotiation (e.g. `1.0`) |
+    | `A2A-Extensions` | Comma-separated list of extension URIs to activate |
+
+    ## Outcome Conformance
+
+    Agent outcomes MUST conform to `FinOSAgentEventVertex` as defined in
+    `finos-workflow-execution-history-openapi.yaml`.
+
+    ## Namespace Placeholders
+
+    Examples in this document use `{vendor-domain}`, `{event-namespace}`,
+    `{source-root}` and `{api-host}` where a wire identifier must live in a
+    namespace the implementation controls. Substitute all four consistently at
+    deployment time; the structure after the namespace root is normative. See
+    README §3.4.
+  contact:
+    name: Blackline Platform Engineering
+    email: platform-eng@blackline.com
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PATHS
+# ══════════════════════════════════════════════════════════════════════════════
+paths:
+
+  # ── A2A Agent Card Discovery ──────────────────────────────────────────────
+  /.well-known/agent-card.json:
+    get:
+      operationId: getAgentCard
+      summary: A2A agent card discovery endpoint
+      description: |
+        Returns the `FinOSAgentCard` — the A2A-compatible discovery document
+        for this agent. Served at the standard A2A well-known path.
+        The card describes the agent's identity, capabilities, skills,
+        security requirements, supported interfaces, and FinOS extension metadata.
+      parameters:
+        - name: A2A-Version
+          in: header
+          required: false
+          schema:
+            type: string
+            default: "1.0"
+          description: A2A protocol version for version negotiation.
+      responses:
+        '200':
+          description: A2A agent card.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FinOSAgentCard'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ── A2A Message Delivery (HTTP binding) ───────────────────────────────────
+  /message:send:
+    post:
+      operationId: sendMessage
+      summary: A2A message delivery endpoint (HTTP binding for a2a.sendMessage)
+      description: |
+        Delivers an A2A `Message` to this agent. This is the HTTP binding for the
+        `a2a.sendMessage` JSON-RPC method. FinOS governance data is carried in
+        `Message.metadata.finos.*` and validated against `FinOSMessageMetadata`.
+
+        Callers may be:
+        - A **WorkflowEngine** scheduling a DAG node
+        - A **peer Agent** delegating a sub-task
+        - A **service** invoking the agent programmatically
+        - A **human operator** (rare; typically mediated via HITL event)
+
+        The agent responds with an A2A `Task` whose state follows the A2A lifecycle:
+        `SUBMITTED → WORKING → COMPLETED | FAILED | CANCELED | INPUT_REQUIRED`
+      parameters:
+        - name: A2A-Version
+          in: header
+          required: false
+          schema:
+            type: string
+            default: "1.0"
+          description: A2A protocol version.
+        - name: A2A-Extensions
+          in: header
+          required: false
+          schema:
+            type: string
+          description: |
+            Comma-separated extension URIs to activate for this request.
+            FinOS agents expect `https://{vendor-domain}/finos/agent-card/v1`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/A2AMessage'
+            examples:
+              workflowNodeMessage:
+                $ref: '#/components/examples/WorkflowNodeMessageExample'
+              agentToAgentMessage:
+                $ref: '#/components/examples/AgentToAgentMessageExample'
+      responses:
+        '200':
+          description: |
+            Message processed. Returns an A2A `Task` with state and history.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/A2ATask'
+        '202':
+          description: Message accepted for asynchronous processing.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/A2ATask'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/PolicyViolation'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+# ══════════════════════════════════════════════════════════════════════════════
+# COMPONENTS
+# ══════════════════════════════════════════════════════════════════════════════
+components:
+
+  # ── Parameters ─────────────────────────────────────────────────────────────
+  parameters:
+
+    AgentIdParam:
+      name: agentId
+      in: path
+      required: true
+      description: Unique identifier of the FinOS agent.
+      schema:
+        type: string
+        format: uuid
+
+  # ── Responses ──────────────────────────────────────────────────────────────
+  responses:
+
+    NotFound:
+      description: Resource not found.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    BadRequest:
+      description: Malformed request body or invalid parameters.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    Unauthorized:
+      description: Authentication credentials missing or invalid.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    PolicyViolation:
+      description: |
+        One or more FinOS policies in `Message.metadata.finos.policies` rejected execution.
+        The response detail describes which policy failed and why.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/PolicyViolationProblem'
+
+    UnprocessableEntity:
+      description: Card schema validation failed.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    InternalError:
+      description: Unexpected internal error.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # SCHEMAS
+  # ══════════════════════════════════════════════════════════════════════════
+  schemas:
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # § ENUMERATIONS
+    # ──────────────────────────────────────────────────────────────────────────
+
+    CallerType:
+      type: string
+      enum:
+        - WORKFLOW_ENGINE   # DAG orchestrator scheduling a node
+        - AGENT             # Peer agent delegating a sub-task
+        - SERVICE           # Programmatic service invocation
+        - HUMAN             # Operator-initiated (rare; usually via HITL)
+      description: The type of entity calling this agent.
+
+    PromptRole:
+      type: string
+      enum:
+        - SYSTEM      # Injected as system-level instruction
+        - USER        # Injected as user-level message
+        - ASSISTANT   # Injected as a prior assistant turn (few-shot)
+      description: The message role of the additional user prompt.
+
+    ContextGraphMode:
+      type: string
+      enum:
+        - RAG_QUERY              # Issue a query against a vector store at runtime
+        - RAG_TENSOR             # Pre-tokenized embedding matrix (tensor / matrix)
+        - FINOSWORKFLOW_GRAPH    # Subgraph of FinOSWorkflowExecutionHistory
+        - STRUCTURED_CHUNKS      # Pre-fetched chunked text documents
+      description: |
+        Discriminator for the four context graph modes supported by FinOS agents.
+
+    SessionStoreType:
+      type: string
+      enum:
+        - REDIS
+        - DYNAMODB
+        - POSTGRES
+        - IN_MEMORY
+        - VECTOR_STORE        # Pinecone, Weaviate, pgvector, etc.
+        - OBJECT_STORE        # S3, GCS — for large binary blobs
+      description: Technology backing the session context store.
+
+    SessionStoreAccessMode:
+      type: string
+      enum:
+        - READ
+        - WRITE
+        - READ_WRITE
+      description: |
+        Access mode granted to this agent for the session context store.
+        The store enforces this at the credential level.
+
+    TensorDtype:
+      type: string
+      enum:
+        - FLOAT32
+        - BFLOAT16
+        - FLOAT16
+        - INT8
+        - INT4           # quantized
+        - BINARY         # 1-bit quantized
+      description: Numeric data type of tensor elements.
+
+    TensorStorageMode:
+      type: string
+      enum:
+        - INLINE_BASE64       # Tensor bytes embedded as base64 string (small tensors)
+        - OBJECT_STORE_URI    # URI to S3/GCS object (large tensors)
+        - SAFETENSORS_URI     # URI to a safetensors file
+        - NUMPY_URI           # URI to a .npy or .npz file
+        - PARQUET_URI         # Columnar format for batch embeddings
+      description: How the tensor data is carried or referenced.
+
+    ExecutionPriority:
+      type: string
+      enum:
+        - LOW
+        - NORMAL
+        - HIGH
+        - CRITICAL
+      description: Execution priority hint for the agent scheduler.
+
+    VariableType:
+      type: string
+      enum:
+        - STRING
+        - NUMBER
+        - BOOLEAN
+        - OBJECT
+        - ARRAY
+        - BINARY       # base64-encoded binary blob
+        - DATETIME
+        - UUID
+        - CURRENCY     # decimal with ISO 4217 currency code
+        - REFERENCE    # pointer to another variable or entity by ID
+      description: Type of a FinOSVariableBinding value.
+
+    DataClassification:
+      type: string
+      enum:
+        - PUBLIC
+        - INTERNAL
+        - CONFIDENTIAL
+        - RESTRICTED
+      description: Data classification label for governance and DLP enforcement.
+
+    A2AInputMode:
+      type: string
+      enum:
+        - text
+        - data
+        - file
+      description: |
+        A2A-compatible input modality. Follows A2A Agent Card specification.
+
+    A2AOutputMode:
+      type: string
+      enum:
+        - text
+        - data
+        - file
+        - stream
+      description: |
+        A2A-compatible output modality. Follows A2A Agent Card specification.
+
+    A2ATaskState:
+      type: string
+      enum:
+        - SUBMITTED        # Task received, not yet started
+        - WORKING          # Agent actively processing
+        - COMPLETED        # Execution complete
+        - FAILED           # Execution failed
+        - CANCELED         # Canceled before completion (A2A single-L spelling)
+        - INPUT_REQUIRED   # Agent needs additional input (HITL)
+        - REJECTED         # Agent rejected the task
+        - AUTH_REQUIRED    # Authentication/authorization needed
+      description: |
+        A2A-conformant task states. Used in A2A Task objects returned by
+        `a2a.sendMessage` / `POST /message:send`.
+
+    TrustTier:
+      type: string
+      enum:
+        - T0   # Platform Native — platform-managed infrastructure
+        - T1   # Certified Partner — BL runtime + SDK
+        - T2   # Registered External — own infrastructure + MCP
+        - T3   # Provisional — unvetted third parties
+      description: |
+        FinOS trust tier assigned to an agent at registration.
+        Determines data access, write permissions, and HITL requirements.
+
+    PolicyEffect:
+      type: string
+      enum:
+        - ALLOW
+        - DENY
+        - REQUIRE_HITL
+      description: Effect of a FinOS policy evaluation.
+
+    SessionScope:
+      type: string
+      enum:
+        - WORKFLOW   # Scoped to the entire workflow execution
+        - STEP       # Scoped to a single workflow step
+        - AGENT      # Scoped to a single agent invocation
+      description: Scope of a FinOS session context store.
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # § A2A MESSAGE & TASK (references to A2A protocol types)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    A2AMessage:
+      type: object
+      required:
+        - messageId
+        - role
+        - parts
+      description: |
+        A2A Message object. FinOS governance data is carried in
+        `metadata.finos` and validated against `FinOSMessageMetadata`.
+      properties:
+        messageId:
+          type: string
+          format: uuid
+          description: Globally unique message identifier.
+        contextId:
+          type: [string, "null"]
+          format: uuid
+          description: |
+            Conversation context identifier. Groups related messages
+            across multiple turns.
+        taskId:
+          type: [string, "null"]
+          format: uuid
+          description: |
+            A2A task identifier. If provided, this message is part of
+            an existing task. If absent, a new task is created.
+        role:
+          type: string
+          enum: [user, agent]
+          description: Message sender role.
+        parts:
+          type: array
+          description: Message content parts (text, data, file references).
+          items:
+            $ref: '#/components/schemas/A2AMessagePart'
+        metadata:
+          type: [object, "null"]
+          description: |
+            A2A message metadata. FinOS governance data is carried under
+            the `finos` key and conforms to `FinOSMessageMetadata`.
+          properties:
+            finos:
+              $ref: '#/components/schemas/FinOSMessageMetadata'
+          additionalProperties: true
+        extensions:
+          type: [array, "null"]
+          items:
+            type: string
+            format: uri
+          description: Extension URIs activated for this message.
+
+    A2AMessagePart:
+      type: object
+      description: A single content part within an A2A Message.
+      properties:
+        kind:
+          type: string
+          enum: [text, data, file]
+          description: Part type discriminator.
+        text:
+          type: [string, "null"]
+          description: Text content (when kind=text).
+        data:
+          type: [object, "null"]
+          additionalProperties: true
+          description: Structured data payload (when kind=data).
+        file:
+          type: [object, "null"]
+          description: File reference (when kind=file).
+          properties:
+            name:
+              type: string
+            mimeType:
+              type: string
+            uri:
+              type: string
+              format: uri
+            bytes:
+              type: string
+              description: Base64-encoded file content.
+        metadata:
+          type: [object, "null"]
+          additionalProperties: true
+
+    A2ATask:
+      type: object
+      required:
+        - id
+        - status
+      description: |
+        A2A Task object returned by `a2a.sendMessage` / `POST /message:send`.
+        Represents the lifecycle of an agent's work on a message.
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Task identifier.
+        contextId:
+          type: [string, "null"]
+          format: uuid
+        status:
+          type: object
+          required: [state]
+          properties:
+            state:
+              $ref: '#/components/schemas/A2ATaskState'
+            message:
+              oneOf:
+                - $ref: '#/components/schemas/A2AMessage'
+                - type: "null"
+              description: Status message from the agent.
+            timestamp:
+              type: string
+              format: date-time
+        artifacts:
+          type: [array, "null"]
+          items:
+            type: object
+            properties:
+              artifactId:
+                type: string
+              parts:
+                type: array
+                items:
+                  $ref: '#/components/schemas/A2AMessagePart'
+              metadata:
+                type: [object, "null"]
+                additionalProperties: true
+        history:
+          type: [array, "null"]
+          items:
+            $ref: '#/components/schemas/A2AMessage'
+          description: Conversation history for this task.
+        metadata:
+          type: [object, "null"]
+          additionalProperties: true
+
+    FinOSSkillRef:
+      type: object
+      required: [skillId, skillName]
+      description: Reference to a FinOS skill active on the agent.
+      properties:
+        skillId:
+          type: string
+          format: uuid
+        skillName:
+          type: string
+          maxLength: 255
+        skillVersion:
+          type: string
+        skillType:
+          type: string
+        description:
+          type: string
+        permittedTools:
+          type: array
+          items:
+            type: string
+          description: Tool names this skill is permitted to invoke.
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # § CALLING CONTEXT ROLE
+    # ──────────────────────────────────────────────────────────────────────────
+
+    FinOSCallingContext:
+      type: object
+      required:
+        - callerId
+        - callerType
+        - sessionId
+        - correlationId
+      description: |
+        Describes WHO is calling this agent and in what workflow/execution context.
+        Controls RBAC enforcement, policy selection, and DAG position tracking.
+        Fields here propagate to the FinOSEventBase of the outcome.
+      properties:
+        callerId:
+          type: string
+          format: uuid
+          description: Unique ID of the calling entity (agent, engine, service, user).
+        callerType:
+          $ref: '#/components/schemas/CallerType'
+        callerRole:
+          type: string
+          maxLength: 255
+          description: |
+            RBAC role under which the caller is acting.
+            Used for policy enforcement and audit trail.
+            Examples: "finance-ops", "senior-approver", "system-orchestrator"
+          example: system-orchestrator
+        sessionId:
+          type: string
+          format: uuid
+          description: |
+            Session identifier shared across all agents in a single user/workflow session.
+            Ties all emitted FinOSAgentEventVertex records to the same session.
+        workflowInstanceId:
+          type: [string, "null"]
+          format: uuid
+          description: |
+            ID of the FinOSWorkflowExecutionHistory instance this agent belongs to.
+            Propagated as `workflowInstanceId` in the outcome's FinOSEventBase.
+        workflowDefinitionId:
+          type: [string, "null"]
+          format: uuid
+          description: ID of the workflow definition being executed.
+        workflowVersionId:
+          type: [string, "null"]
+          format: uuid
+          description: ID of the specific workflow version being executed.
+        nodeInstanceId:
+          type: [string, "null"]
+          format: uuid
+          description: |
+            The `NodeInstanceVertex.nodeId` of the DAG node this agent is executing as.
+            Enables the workflow engine to correlate the outcome to its DAG position.
+        dagDepth:
+          type: integer
+          minimum: 0
+          description: |
+            Depth of this agent node in the DAG (root = 0).
+            Used for cycle detection and execution budget enforcement.
+          default: 0
+        parentAgentId:
+          type: [string, "null"]
+          format: uuid
+          description: |
+            If callerType is AGENT, the agentId of the delegating parent agent.
+        correlationId:
+          type: string
+          format: uuid
+          description: |
+            Distributed tracing correlation ID. Propagated to all downstream calls
+            and the outcome's `correlationId` field.
+        traceId:
+          type: [string, "null"]
+          description: |
+            OpenTelemetry W3C TraceContext trace ID (hex, 32 chars).
+            Injected into the outcome's `traceId` field.
+          pattern: '^[0-9a-f]{32}$'
+        spanId:
+          type: [string, "null"]
+          description: |
+            OpenTelemetry span ID for this agent invocation (hex, 16 chars).
+            Injected into the outcome's `spanId` field.
+          pattern: '^[0-9a-f]{16}$'
+        executionPriority:
+          $ref: '#/components/schemas/ExecutionPriority'
+          default: NORMAL
+        maxExecutionMs:
+          type: [integer, "null"]
+          minimum: 0
+          description: |
+            Maximum allowed wall-clock execution time in milliseconds.
+            Agent MUST abort and emit a FAILED outcome if exceeded.
+          example: 30000
+        retryPolicy:
+          type: object
+          description: Retry configuration for this invocation.
+          properties:
+            maxAttempts:
+              type: integer
+              minimum: 1
+              maximum: 10
+              default: 1
+            backoffMs:
+              type: integer
+              minimum: 0
+              default: 1000
+            retryOn:
+              type: array
+              items:
+                type: string
+                enum: [TIMEOUT, RATE_LIMIT, TRANSIENT_ERROR]
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # § ADDITIONAL USER PROMPT
+    # ──────────────────────────────────────────────────────────────────────────
+
+    FinOSAdditionalPrompt:
+      type: object
+      required:
+        - promptText
+        - promptRole
+      description: |
+        An additional prompt injected by the calling context into the agent's
+        context window. May supplement or override the agent's base system prompt.
+        Used by the workflow engine to pass per-execution instructions, or by a
+        parent agent to provide sub-task framing.
+      properties:
+        promptId:
+          type: string
+          format: uuid
+          description: Unique ID for this prompt fragment (for audit and replay).
+        promptText:
+          type: string
+          maxLength: 65536
+          description: The prompt text to inject.
+        promptRole:
+          $ref: '#/components/schemas/PromptRole'
+          description: |
+            Message role under which this prompt is injected.
+            SYSTEM prompts override or precede the agent's base system prompt.
+            USER prompts are appended as the first user turn.
+        promptPriority:
+          type: integer
+          minimum: 0
+          maximum: 100
+          default: 50
+          description: |
+            Priority (0=lowest, 100=highest). When multiple additional prompts
+            are present, higher priority prompts are placed earlier in context.
+        isOverride:
+          type: boolean
+          default: false
+          description: |
+            If true, this prompt REPLACES the agent's base system prompt.
+            If false (default), it is APPENDED to the base system prompt.
+        languageCode:
+          type: string
+          description: |
+            BCP-47 language code for the prompt (e.g. "en-US", "fr-FR").
+          example: en-US
+          default: en-US
+        promptTemplateId:
+          type: [string, "null"]
+          format: uuid
+          description: |
+            Optional reference to a registered FinOS prompt template that
+            this text was rendered from. Propagated to the outcome's
+            `promptTemplate` field.
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # § CONTEXT GRAPHS (polymorphic, four modes)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    FinOSContextGraph:
+      type: object
+      required:
+        - contextGraphId
+        - mode
+      description: |
+        A context graph supplied to the agent in one of four modes.
+        Multiple context graphs may coexist in a single card (e.g. a RAG_QUERY
+        for live retrieval AND a RAG_TENSOR for a pre-computed summary).
+        The agent runtime assembles them in `rank` order into the context window.
+      properties:
+        contextGraphId:
+          type: string
+          format: uuid
+          description: Unique ID for this context graph fragment.
+        mode:
+          $ref: '#/components/schemas/ContextGraphMode'
+        rank:
+          type: integer
+          minimum: 0
+          default: 0
+          description: |
+            Assembly order. Lower rank = assembled first (higher positional
+            priority in the context window). Ties broken by contextGraphId.
+        description:
+          type: string
+          maxLength: 512
+          description: Human-readable label for this context graph.
+        # ── Mode: RAG_QUERY ──────────────────────────────────────────────────
+        ragQuery:
+          oneOf:
+            - $ref: '#/components/schemas/FinOSRAGQueryContext'
+            - type: "null"
+          description: |
+            Populated when `mode = RAG_QUERY`.
+            Instructs the agent to issue a live vector similarity search at
+            invocation time and inject the retrieved chunks into context.
+        # ── Mode: RAG_TENSOR ─────────────────────────────────────────────────
+        ragTensor:
+          oneOf:
+            - $ref: '#/components/schemas/FinOSRAGTensorContext'
+            - type: "null"
+          description: |
+            Populated when `mode = RAG_TENSOR`.
+            An already-tokenized embedding matrix (tensor) injected directly
+            as a dense context representation, bypassing the retrieval step.
+        # ── Mode: FINOSWORKFLOW_GRAPH ────────────────────────────────────────
+        finOSWorkflowGraph:
+          oneOf:
+            - $ref: '#/components/schemas/FinOSWorkflowGraphContext'
+            - type: "null"
+          description: |
+            Populated when `mode = FINOSWORKFLOW_GRAPH`.
+            A subgraph of a FinOSWorkflowExecutionHistory DAG serialized
+            and injected as structured context.
+        # ── Mode: STRUCTURED_CHUNKS ──────────────────────────────────────────
+        structuredChunks:
+          oneOf:
+            - $ref: '#/components/schemas/FinOSStructuredChunksContext'
+            - type: "null"
+          description: |
+            Populated when `mode = STRUCTURED_CHUNKS`.
+            Pre-fetched, pre-chunked text documents injected as named context
+            blocks.
+
+    FinOSRAGQueryContext:
+      type: object
+      required:
+        - vectorStoreId
+        - queryText
+      description: |
+        Instructs the agent to issue a vector similarity query against the
+        specified vector store at invocation time. The retrieved chunks are
+        ranked and injected into the context window before the agent begins
+        reasoning.
+      properties:
+        vectorStoreId:
+          type: string
+          format: uuid
+          description: ID of the registered vector store to query.
+        vectorStoreUri:
+          type: [string, "null"]
+          format: uri
+          description: |
+            Override URI for the vector store (e.g. Pinecone index URL,
+            pgvector connection string, Weaviate class endpoint).
+        queryText:
+          type: string
+          maxLength: 8192
+          description: |
+            The natural-language query text used to generate the query embedding.
+            May be the user's question, a reformulated retrieval query, or a
+            structured description of what context is needed.
+        queryEmbedding:
+          type: [string, "null"]
+          description: |
+            Optional pre-computed query embedding (base64-encoded float32 vector).
+            If provided, the agent uses this embedding directly instead of
+            re-encoding `queryText`.
+        embeddingModel:
+          type: string
+          description: |
+            Embedding model used to encode `queryText` (if `queryEmbedding` absent).
+            Must be consistent with the model used to index the vector store.
+          example: text-embedding-3-large
+        topK:
+          type: integer
+          minimum: 1
+          maximum: 200
+          default: 10
+          description: Maximum number of chunks to retrieve.
+        similarityThreshold:
+          type: number
+          format: double
+          minimum: 0.0
+          maximum: 1.0
+          default: 0.75
+          description: |
+            Minimum cosine similarity score. Chunks below this threshold are
+            discarded even if they are in the top-K results.
+        namespace:
+          type: [string, "null"]
+          description: |
+            Vector store namespace / collection to query (e.g. Pinecone namespace,
+            Weaviate class, pgvector schema).
+        metadataFilter:
+          type: [object, "null"]
+          additionalProperties: true
+          description: |
+            Key-value filter applied to chunk metadata before similarity ranking
+            (e.g. `{"documentType": "invoice", "fiscalYear": 2026}`).
+        rerankModel:
+          type: [string, "null"]
+          description: |
+            Optional cross-encoder reranker model applied after initial retrieval
+            (e.g. "cohere-rerank-v3").
+        includeMetadata:
+          type: boolean
+          default: true
+          description: Whether to include chunk metadata alongside retrieved text.
+        chunkTemplate:
+          type: [string, "null"]
+          maxLength: 2048
+          description: |
+            Jinja2/Mustache template for formatting each retrieved chunk before
+            context injection. Default: `"[Source: {{source}}]\n{{text}}"`.
+
+    FinOSRAGTensorContext:
+      type: object
+      required:
+        - tensorId
+        - embeddingModel
+        - dtype
+        - shape
+        - storageMode
+      description: |
+        A pre-tokenized, pre-embedded tensor representing context that has already
+        been retrieved and encoded. Used when the caller has pre-computed context
+        embeddings (e.g. cached from a prior retrieval, or generated by a
+        dedicated embedding pipeline) and wants to inject them directly into the
+        agent's attention mechanism or context assembly pipeline, bypassing
+        live retrieval.
+
+        This mode supports both dense embedding matrices
+        (shape `[numChunks, embeddingDim]`) and raw token ID sequences
+        (shape `[batchSize, seqLen]`) for attention-injection use cases.
+      properties:
+        tensorId:
+          type: string
+          format: uuid
+          description: Unique ID for this tensor payload.
+        embeddingModel:
+          type: string
+          description: |
+            Name of the model used to generate the embeddings.
+            Must be compatible with the agent's LLM embedding space.
+          example: text-embedding-3-large
+        tokenVocabularyId:
+          type: [string, "null"]
+          description: |
+            Identifier of the tokenizer vocabulary (e.g. "cl100k_base", "o200k_base").
+            Required when `tensorMode = TOKEN_IDS`.
+        tensorMode:
+          type: string
+          enum:
+            - EMBEDDING_MATRIX    # Dense float embeddings [numChunks × embeddingDim]
+            - TOKEN_IDS           # Integer token ID sequence [batchSize × seqLen]
+            - ATTENTION_MASK      # Binary attention mask [batchSize × seqLen]
+          description: Semantic interpretation of the tensor shape.
+          default: EMBEDDING_MATRIX
+        dtype:
+          $ref: '#/components/schemas/TensorDtype'
+        shape:
+          type: array
+          items:
+            type: integer
+            minimum: 1
+          minItems: 2
+          maxItems: 4
+          description: |
+            Tensor dimensions in row-major order. Examples:
+            - Embedding matrix: `[1024, 4096]` = 1024 chunks × 4096-dim embeddings
+            - Token IDs: `[1, 8192]` = batch size 1, sequence length 8192
+          example: [512, 1536]
+        sequenceLength:
+          type: integer
+          minimum: 1
+          description: Number of tokens or chunks in the encoded sequence.
+        dimensions:
+          type: integer
+          minimum: 1
+          description: Embedding vector dimensionality (for EMBEDDING_MATRIX mode).
+        storageMode:
+          $ref: '#/components/schemas/TensorStorageMode'
+        data:
+          type: [string, "null"]
+          description: |
+            Base64-encoded tensor bytes (row-major, dtype-native byte order).
+            Only used when `storageMode = INLINE_BASE64`.
+            Maximum recommended size: 1 MB inline; use URI modes for larger tensors.
+        storageUri:
+          type: [string, "null"]
+          format: uri
+          description: |
+            URI to the externally stored tensor file.
+            Used when `storageMode` is any URI-based mode.
+            Supported schemes: `s3://`, `gs://`, `https://`
+        storageCredentialRef:
+          type: [string, "null"]
+          format: uuid
+          description: |
+            Reference to a credential in the session vault for authenticated
+            access to the storage URI. The agent retrieves the credential
+            server-side without exposing it.
+        checksumSha256:
+          type: [string, "null"]
+          pattern: '^[0-9a-f]{64}$'
+          description: SHA-256 hex digest of the raw tensor bytes for integrity verification.
+        sourceDocumentIds:
+          type: [array, "null"]
+          items:
+            type: string
+          description: |
+            IDs of the source documents or chunks encoded in this tensor.
+            Used for citation, audit, and provenance tracking.
+        compressionCodec:
+          type: string
+          enum: [NONE, GZIP, ZSTD, LZ4]
+          default: NONE
+          description: Compression applied to the tensor bytes before base64 encoding or storage.
+        metadata:
+          type: [object, "null"]
+          additionalProperties: true
+          description: Arbitrary key-value metadata about this tensor context.
+
+    FinOSWorkflowGraphContext:
+      type: object
+      required:
+        - workflowInstanceId
+      description: |
+        Provides a subgraph of a `FinOSWorkflowExecutionHistory` DAG as context.
+        The agent runtime retrieves and serializes the selected vertices and edges
+        into a structured text representation injected into the context window.
+        Useful for agents that reason over execution history (e.g. auditors,
+        summarizers, escalation analyzers).
+      properties:
+        workflowInstanceId:
+          type: string
+          format: uuid
+          description: The FinOSWorkflowExecutionHistory instanceId to query.
+        anchorVertexId:
+          type: [string, "null"]
+          format: uuid
+          description: |
+            If provided, only include the subgraph reachable from this vertex.
+        includeVertexTypes:
+          type: [array, "null"]
+          items:
+            type: string
+          description: |
+            Filter to only include these vertex types in the context subgraph.
+            If empty, all types are included.
+          example: [FinOSAgentEvent, FinOSPolicyEvent, ApprovalTier]
+        includeEdgeTypes:
+          type: [array, "null"]
+          items:
+            type: string
+          description: Filter to only include these edge types.
+        maxDepth:
+          type: integer
+          minimum: 1
+          maximum: 20
+          default: 5
+          description: Maximum traversal depth from the anchor vertex.
+        serializationFormat:
+          type: string
+          enum:
+            - JSON_LD       # JSON-LD linked data
+            - MARKDOWN_TABLE # Tabular markdown representation
+            - CYTOSCAPE_JSON # Cytoscape.js elements JSON
+            - ADJACENCY_TEXT # Plain-text adjacency list
+          default: MARKDOWN_TABLE
+          description: How the retrieved subgraph is serialized into the context window.
+
+    FinOSStructuredChunksContext:
+      type: object
+      required:
+        - chunks
+      description: |
+        Pre-fetched, pre-chunked text documents provided directly in the card.
+        Used when the caller has already performed retrieval (e.g. via a separate
+        search step in the workflow) and wants to pass specific chunks to the agent.
+      properties:
+        chunks:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/FinOSContextChunk'
+        assemblyOrder:
+          type: string
+          enum:
+            - RANK_ASC      # Lower rank first (default)
+            - RANK_DESC     # Higher rank first
+            - RELEVANCE     # Rerank by relevance score if available
+          default: RANK_ASC
+
+    FinOSContextChunk:
+      type: object
+      required:
+        - chunkId
+        - text
+      description: A single text chunk to inject into the agent context window.
+      properties:
+        chunkId:
+          type: string
+          format: uuid
+        text:
+          type: string
+          maxLength: 65536
+          description: The chunk text content.
+        sourceId:
+          type: [string, "null"]
+          description: ID or URI of the source document.
+        sourceTitle:
+          type: [string, "null"]
+          description: Human-readable title of the source.
+        relevanceScore:
+          type: [number, "null"]
+          format: double
+          minimum: 0.0
+          maximum: 1.0
+          description: Similarity or relevance score (0–1).
+        rank:
+          type: integer
+          minimum: 0
+          default: 0
+          description: Position in context assembly order.
+        dataClassification:
+          oneOf:
+            - $ref: '#/components/schemas/DataClassification'
+            - type: "null"
+        metadata:
+          type: [object, "null"]
+          additionalProperties: true
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # § SESSION CONTEXT STORE REFERENCE
+    # ──────────────────────────────────────────────────────────────────────────
+
+    FinOSSessionContextStoreRef:
+      type: object
+      required:
+        - storeId
+        - storeType
+        - storeUri
+        - namespace
+        - accessMode
+      description: |
+        Reference to the in-session context store shared across all agents in a
+        workflow execution. The agent may read from and/or write to this store
+        within the scope of the granted `accessMode`.
+
+        The store serves as the shared state bus between DAG nodes:
+        - Upstream agents WRITE their output variables
+        - Downstream agents READ them as input variables
+        - The session context store is the single source of truth for
+          inter-agent data passing within a workflow session.
+
+        Credential secrets are NEVER included inline; they are referenced
+        via `credentialRef` and resolved server-side (vault pattern).
+      properties:
+        storeId:
+          type: string
+          format: uuid
+          description: Unique identifier of this context store instance.
+        storeType:
+          $ref: '#/components/schemas/SessionStoreType'
+        storeUri:
+          type: string
+          format: uri
+          description: |
+            Base URI of the context store.
+            Examples:
+            - Redis: `redis://session-store.erp.internal:6379`
+            - DynamoDB: `dynamodb://us-east-1/finos-session-store`
+            - pgvector: `postgresql://pgvector.erp.internal:5432/finos`
+        namespace:
+          type: string
+          maxLength: 256
+          description: |
+            Key namespace / prefix scoped to this workflow session.
+            All keys written by agents are prefixed with `{namespace}:`.
+            Format: `{tenantId}/{workflowInstanceId}/{sessionId}`
+          example: tenant-acme-prod/3fa85f64-.../7f3d8c1a-...
+        accessMode:
+          $ref: '#/components/schemas/SessionStoreAccessMode'
+        credentialRef:
+          type: [string, "null"]
+          format: uuid
+          description: |
+            Reference to a credential in the session vault.
+            The store access credential is resolved server-side and never
+            exposed to the agent's sandbox environment.
+        ttlSeconds:
+          type: [integer, "null"]
+          minimum: 0
+          description: |
+            Time-to-live for keys written by this agent.
+            0 = no TTL (keys persist until explicit deletion).
+          default: 3600
+        readKeys:
+          type: [array, "null"]
+          items:
+            type: string
+          description: |
+            Specific keys (within `namespace`) to pre-fetch into agent memory
+            at session start. Keys not listed here can still be read on demand.
+        writeSchema:
+          type: [object, "null"]
+          additionalProperties: true
+          description: |
+            JSON Schema constraining the values the agent may write to the store.
+            If provided, the store enforces schema validation on writes.
+            Prevents agents from polluting the store with unstructured data.
+        readOnlyKeys:
+          type: [array, "null"]
+          items:
+            type: string
+          description: |
+            Keys that are explicitly READ-ONLY for this agent even if
+            `accessMode` is READ_WRITE. Prevents accidental overwrites
+            of upstream agent outputs.
+        encryptionKeyId:
+          type: [string, "null"]
+          description: |
+            ID of the CMEK (Customer-Managed Encryption Key) used to
+            encrypt sensitive values at rest in this store.
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # § FINOS POLICY (inline definition — mirrors FinOSPolicyVertex)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    FinOSAgentPolicy:
+      type: object
+      required:
+        - policyId
+        - policyName
+        - policyType
+        - enforcementMode
+      description: |
+        A FinOS policy instance that GOVERNS this agent's execution.
+        Mirrors `FinOSPolicyVertex` from the workflow execution history schema,
+        extended with enforcement mode and failure handling.
+
+        The agent MUST evaluate all policies BEFORE executing any tool calls.
+        Policy failures result in a `POLICY_BLOCKED` card status and a
+        `FinOSPolicyEvent` vertex emitted in the outcome.
+      properties:
+        policyId:
+          type: string
+          format: uuid
+          description: Globally unique policy identifier.
+        policyName:
+          type: string
+          maxLength: 255
+        policyVersion:
+          type: string
+          description: Semantic version of this policy definition.
+        policyType:
+          type: string
+          enum:
+            - APPROVAL            # Requires explicit human approval before proceeding
+            - COMPLIANCE          # Regulatory compliance gate
+            - RISK                # Risk scoring threshold
+            - ACCESS_CONTROL      # Permission enforcement
+            - DATA_GOVERNANCE     # Data handling and classification rules
+            - SPENDING_LIMIT      # Financial threshold gate
+            - RATE_LIMIT          # Call frequency control
+          description: Category of policy.
+        enforcementMode:
+          type: string
+          enum:
+            - BLOCK               # Halt execution if policy fails
+            - WARN                # Log warning, continue execution
+            - AUDIT               # Record only — no execution impact
+          description: |
+            How the agent responds to a policy evaluation failure.
+            BLOCK is the default and required for APPROVAL and COMPLIANCE types.
+          default: BLOCK
+        escalationRole:
+          type: [string, "null"]
+          description: |
+            Role to escalate to if this policy evaluates to `Escalate` or
+            `AttentionRequired`. Propagated to the FinOSPolicyEvent outcome.
+        rules:
+          type: array
+          description: |
+            Ordered list of evaluation rules. Rules are evaluated top-to-bottom;
+            first failing rule determines the outcome.
+          items:
+            type: object
+            required: [ruleId, ruleExpression]
+            properties:
+              ruleId:
+                type: string
+              ruleExpression:
+                type: string
+                description: |
+                  Policy rule expression in FinOS Policy Expression Language (FPEL)
+                  or OPA Rego. Example: `inputVariables.amount <= 50000`
+              ruleDescription:
+                type: string
+              severity:
+                type: string
+                enum: [INFO, WARNING, ERROR, CRITICAL]
+        effectiveDate:
+          type: [string, "null"]
+          format: date
+          description: Date from which this policy version is enforceable.
+        expirationDate:
+          type: [string, "null"]
+          format: date
+          description: Date after which this policy version expires.
+        owner:
+          type: [string, "null"]
+          description: Team or role that owns and maintains this policy.
+        externalPolicyUri:
+          type: [string, "null"]
+          format: uri
+          description: |
+            URI to the authoritative external policy document
+            (e.g. OPA bundle URL, compliance framework reference).
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # § VARIABLE BINDINGS (input / output)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    FinOSVariableBinding:
+      type: object
+      required:
+        - variableId
+        - name
+        - type
+      description: |
+        A single typed, classified variable binding. Used in both `inputVariables`
+        and `outputVariables` maps. The `value` field is null for output
+        variable templates (the agent populates it on completion).
+      properties:
+        variableId:
+          type: string
+          format: uuid
+          description: Unique identifier for this variable binding.
+        name:
+          type: string
+          maxLength: 255
+          description: |
+            Variable name. Must be a valid identifier (letters, digits, underscores).
+            Forms the key in the parent `variables` map.
+          pattern: '^[a-zA-Z_][a-zA-Z0-9_]*$'
+        type:
+          $ref: '#/components/schemas/VariableType'
+        value:
+          description: |
+            The variable's value. Null for output variable templates.
+            Type MUST conform to `type`:
+            - STRING → JSON string
+            - NUMBER → JSON number
+            - BOOLEAN → JSON boolean
+            - OBJECT → JSON object
+            - ARRAY → JSON array
+            - BINARY → base64-encoded string
+            - DATETIME → ISO 8601 string
+            - UUID → UUID string
+            - CURRENCY → `{"amount": 48500.00, "currency": "USD"}`
+            - REFERENCE → `{"entityType": "Invoice", "entityId": "<uuid>"}`
+        dataClassification:
+          $ref: '#/components/schemas/DataClassification'
+          description: |
+            Classification label. Variables marked CONFIDENTIAL or RESTRICTED
+            are automatically redacted from logs and the FinOSAgentEventVertex
+            outcome's `evidence` field.
+          default: INTERNAL
+        required:
+          type: boolean
+          default: false
+          description: |
+            For inputVariables: if true, agent MUST abort if this variable
+            is not provided.
+            For outputVariables: if true, agent MUST populate this variable
+            before completing.
+        description:
+          type: string
+          maxLength: 1024
+          description: Human-readable description of what this variable represents.
+        constraints:
+          type: [object, "null"]
+          description: |
+            Optional JSON Schema constraints applied to `value`.
+            The store and policy engine enforce these constraints.
+          additionalProperties: true
+        sourceAgentId:
+          type: [string, "null"]
+          format: uuid
+          description: |
+            For input variables: the agentId of the upstream agent that produced
+            this value (if read from the session context store).
+        storeKey:
+          type: [string, "null"]
+          description: |
+            The session context store key this variable is bound to.
+            When the agent reads/writes this variable, it uses this key in
+            the store namespace.
+
+    FinOSAgentInputVariables:
+      type: [object, "null"]
+      description: |
+        Nullable map of named input variables passed to the agent.
+        Keys are variable names (matching `FinOSVariableBinding.name`).
+        The agent reads these from the card payload and/or the session
+        context store (`storeKey` bindings).
+      properties:
+        variables:
+          type: [object, "null"]
+          additionalProperties:
+            $ref: '#/components/schemas/FinOSVariableBinding'
+          description: |
+            Key-value map where keys are variable names.
+            Example: `{ "invoiceAmount": {...}, "vendorId": {...} }`
+
+    FinOSAgentOutputVariables:
+      type: [object, "null"]
+      description: |
+        Nullable map of named output variable templates. The agent populates
+        the `value` of each binding on completion and writes them to the
+        session context store under their respective `storeKey` bindings.
+        Downstream agents in the DAG may consume these as inputVariables.
+      properties:
+        variables:
+          type: [object, "null"]
+          additionalProperties:
+            $ref: '#/components/schemas/FinOSVariableBinding'
+          description: |
+            Key-value map where keys are variable names.
+            On input: `value` is null (template).
+            On output: agent populates `value`.
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # § OUTCOME — FinOSAgentEventVertex (CloudEvent-compliant)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    FinOSAgentCardOutcome:
+      type: object
+      description: |
+        The outcome emitted by the agent after execution. MUST fully conform to
+        `FinOSAgentEventVertex` as defined in `finos-workflow-execution-history-openapi.yaml`.
+
+        Conformance means satisfying all three inheritance layers:
+        1. `FinOSVertexBase` — vertexId, vertexType, label, finOSEdgeIds
+        2. `FinOSEventBase → CloudEventBase` — id, source, specversion, type,
+           time, finOSEventType, workflowInstanceId, correlationId, tenantId,
+           traceId, spanId
+        3. `FinOSAgentEventVertex` — agent, agentRun, llmModelName,
+           llmModelVersion, promptTemplate, toolCall, skills, humanTask,
+           humanDecision, evidence
+
+        The `outputVariables` map is serialized into the outcome's `data` field
+        (CloudEvent payload) under the key `"outputVariables"`.
+
+        ## Outcome Population Contract
+
+        | Card field | Outcome field |
+        |---|---|
+        | `identity.agentId` | `agent.agentId` |
+        | `identity.agentName` | `agent.agentName` |
+        | `identity.llmModelName` | `llmModelName` |
+        | `identity.llmModelVersion` | `llmModelVersion` |
+        | `identity.skills[]` | `skills[]` |
+        | `envelope.cardId` | `id` (CloudEvent event ID) |
+        | `callingContext.workflowInstanceId` | `workflowInstanceId` |
+        | `callingContext.correlationId` | `correlationId` |
+        | `callingContext.traceId` | `traceId` |
+        | `callingContext.spanId` | `spanId` |
+        | `authentication.tenantId` | `tenantId` |
+        | `additionalPrompt.promptTemplateId` | `promptTemplate` |
+        | `outputVariables.variables` | `data.outputVariables` |
+
+      # ── CloudEvent required fields ─────────────────────────────────────────
+      required:
+        - id
+        - source
+        - specversion
+        - type
+        - vertexId
+        - vertexType
+        - finOSEventType
+        - workflowInstanceId
+        - tenantId
+        - agent
+        - agentRun
+      properties:
+        # CloudEvent base
+        id:
+          type: string
+          description: |
+            [CloudEvent] Event ID. Set to the `envelope.cardId` of the invoking
+            card to maintain end-to-end correlation.
+        source:
+          type: string
+          format: uri-reference
+          description: |
+            [CloudEvent] URI identifying the event producer.
+            Format: `{source-root}/finos/agent/{agentId}`
+          example: /finos/agent/7f3d8c1a-0000-0000-0000-000000000001
+        specversion:
+          type: string
+          enum: ["1.0"]
+          description: "[CloudEvent] Always '1.0'."
+        type:
+          type: string
+          description: |
+            [CloudEvent] Reverse-DNS event type.
+            Convention: `{event-namespace}.finos.agent.{agentType}.{action}`
+          example: "{event-namespace}.finos.agent.executor.completed"
+        datacontenttype:
+          type: string
+          default: application/json
+        subject:
+          type: [string, "null"]
+          description: |
+            [CloudEvent] Subject of the event.
+            Convention: `workflow-instance/{workflowInstanceId}`
+        time:
+          type: string
+          format: date-time
+          description: "[CloudEvent] Event occurrence timestamp (RFC 3339)."
+        data:
+          type: [object, "null"]
+          description: |
+            [CloudEvent] Domain-specific payload.
+            Contains: `{ "outputVariables": {...}, "summary": "...", ... }`
+          additionalProperties: true
+        # FinOSVertexBase
+        vertexId:
+          type: string
+          format: uuid
+          description: |
+            Vertex ID within the FinOSWorkflowExecutionHistory DAG.
+            Typically set to `callingContext.nodeInstanceId`.
+        vertexType:
+          type: string
+          enum: [FinOSAgentEvent]
+          description: Always 'FinOSAgentEvent' for agent outcomes.
+        label:
+          type: [string, "null"]
+          description: Human-readable label for this vertex in the DAG graph.
+        finOSEdgeIds:
+          type: [array, "null"]
+          items:
+            type: string
+            format: uuid
+          description: Edge IDs populated by the workflow engine after the vertex is persisted.
+          readOnly: true
+        # FinOSEventBase
+        finOSEventType:
+          type: string
+          enum: [FinOSAgentEvent]
+          description: Always 'FinOSAgentEvent'.
+        workflowInstanceId:
+          type: string
+          format: uuid
+        correlationId:
+          type: [string, "null"]
+          format: uuid
+        tenantId:
+          type: string
+        traceId:
+          type: [string, "null"]
+        spanId:
+          type: [string, "null"]
+        # FinOSAgentEventVertex specifics
+        agent:
+          type: object
+          required: [agentId, agentName]
+          description: Agent identity. Sourced from `identity.*` in the card.
+          properties:
+            agentId:
+              type: string
+              format: uuid
+            agentName:
+              type: string
+            agentType:
+              type: string
+            agentVersion:
+              type: string
+            capabilities:
+              type: array
+              items:
+                type: string
+        agentRun:
+          type: object
+          required: [runId, runStatus]
+          description: |
+            Runtime execution metadata. Populated by the agent runtime after execution.
+          properties:
+            runId:
+              type: string
+              format: uuid
+            runStatus:
+              type: string
+              enum: [PENDING, RUNNING, COMPLETED, FAILED, SKIPPED, RETRYING]
+            startTime:
+              type: string
+              format: date-time
+            endTime:
+              type: [string, "null"]
+              format: date-time
+            tokenUsage:
+              type: object
+              properties:
+                inputTokens:
+                  type: integer
+                  minimum: 0
+                outputTokens:
+                  type: integer
+                  minimum: 0
+                totalTokens:
+                  type: integer
+                  minimum: 0
+                estimatedCostUsd:
+                  type: number
+                  format: double
+        llmModelName:
+          type: [string, "null"]
+        llmModelVersion:
+          type: [string, "null"]
+        promptTemplate:
+          type: [string, "null"]
+          description: |
+            Prompt template ID or rendered content used for this invocation.
+            Sourced from `additionalPrompt.promptTemplateId` if set.
+        toolCalls:
+          type: [array, "null"]
+          description: Tool calls made by the agent during execution.
+          items:
+            type: object
+            properties:
+              toolCallId:
+                type: string
+                format: uuid
+              toolName:
+                type: string
+              toolInput:
+                type: object
+                additionalProperties: true
+              toolOutput:
+                type: object
+                additionalProperties: true
+              executionTimeMs:
+                type: integer
+              status:
+                type: string
+                enum: [PENDING, RUNNING, COMPLETED, FAILED, SKIPPED, RETRYING]
+              errorMessage:
+                type: [string, "null"]
+        skills:
+          type: [array, "null"]
+          items:
+            $ref: '#/components/schemas/FinOSSkillRef'
+        humanTask:
+          type: [object, "null"]
+          description: HITL task generated by this agent run, if any.
+          properties:
+            taskId:
+              type: string
+              format: uuid
+            taskType:
+              type: string
+            assignedTo:
+              type: string
+            description:
+              type: string
+            dueDate:
+              type: [string, "null"]
+              format: date-time
+            priority:
+              type: string
+              enum: [LOW, MEDIUM, HIGH, CRITICAL]
+        humanDecision:
+          type: [object, "null"]
+          description: Human decision recorded against this event, if any.
+          properties:
+            decisionId:
+              type: string
+              format: uuid
+            decision:
+              type: string
+              enum: [APPROVED, REJECTED, ESCALATED, ACKNOWLEDGED, DEFERRED]
+            justification:
+              type: [string, "null"]
+            decidedBy:
+              type: string
+            decidedAt:
+              type: string
+              format: date-time
+        evidence:
+          type: [object, "null"]
+          description: |
+            Evidence artifact produced by this agent run.
+            Includes the populated `outputVariables` map.
+          properties:
+            evidenceId:
+              type: string
+              format: uuid
+            evidenceType:
+              type: string
+            evidenceData:
+              type: object
+              description: |
+                Contains `outputVariables` map and any agent-generated evidence.
+              additionalProperties: true
+            source:
+              type: string
+            collectedAt:
+              type: string
+              format: date-time
+            hash:
+              type: [string, "null"]
+              description: SHA-256 hash of evidenceData for tamper detection.
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # § A2A AGENT EXTENSION
+    # ──────────────────────────────────────────────────────────────────────────
+
+    AgentExtension:
+      type: object
+      required:
+        - uri
+      description: |
+        A2A-compatible extension entry, following the A2A Agent Card
+        specification for `capabilities.extensions[]`. Extensions carry structured
+        metadata beyond the core A2A fields. Callers that receive `required: true`
+        on an extension they do not understand MUST NOT invoke the agent.
+      properties:
+        uri:
+          type: string
+          format: uri
+          description: |
+            Globally unique URI identifying the extension type and version.
+            FinOS extension URI: `https://{vendor-domain}/finos/agent-card/v1`
+        required:
+          type: boolean
+          default: false
+          description: |
+            If true, callers that do not understand this extension MUST NOT invoke
+            the agent. FinOS agents set this to true for the FinOS extension.
+        description:
+          type: string
+          description: Human-readable explanation of what this extension carries.
+        params:
+          type: [object, "null"]
+          additionalProperties: true
+          description: Extension-specific parameters. Schema is defined by the extension URI.
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # § FINOS EXTENSION PARAMS SUPPORTING SCHEMAS
+    # ──────────────────────────────────────────────────────────────────────────
+
+    FinOSLlmModelEntry:
+      type: object
+      required:
+        - modelId
+      description: |
+        One entry in a FinOS Agent's model roster
+        (`FinOSAgentExtensionParams.finOSLlmModels`).
+
+        Entries are ordered by priority (index 0 = highest priority / default).
+        A composite agent that routes sub-tasks to specialised models declares
+        all models here with `taskAffinity` annotations. Sub-agents that do not
+        publish their own Agent Card have their model usage declared in the
+        parent agent's `finOSLlmModels` list.
+      properties:
+        modelId:
+          type: string
+          description: |
+            Model identifier as accepted by the provider's API.
+            Examples: `"claude-sonnet-4-6"`, `"gpt-4o"`,
+            `"llama-3.1-70b-instruct"`.
+          example: claude-sonnet-4-6
+        provider:
+          type: [string, "null"]
+          description: |
+            Provider identifier for the model host.
+            Well-known values: `"anthropic"`, `"openai"`,
+            `"meta"`, `"self-hosted"`.
+          example: anthropic
+        version:
+          type: [string, "null"]
+          description: |
+            Exact model snapshot or version string. Set when pinning to a
+            specific checkpoint is required for reproducibility and audit.
+            Example: `"20250514"`.
+        taskAffinity:
+          type: [array, "null"]
+          items:
+            type: string
+          description: |
+            Sub-task or sub-agent role identifiers for which this model is
+            preferentially selected at invocation routing time.
+            When `null` or empty, the model is eligible for all tasks not
+            covered by a more-specific entry in the roster.
+
+            This is the primary mechanism for per-task model routing inside
+            a composite agent without requiring each sub-agent to publish
+            its own Agent Card.
+          example:
+            - DOCUMENT_EXTRACTION
+            - LINE_ITEM_PARSING
+        contextWindowTokens:
+          type: [integer, "null"]
+          minimum: 0
+          description: |
+            Declared context window capacity in tokens for this model entry.
+            Used by the orchestrator when assembling context graphs to avoid
+            exceeding the model's token limit.
+        isDefault:
+          type: boolean
+          default: false
+          description: |
+            If `true`, this is the fallback model for invocations where no
+            other entry's `taskAffinity` matches the current sub-task.
+            At most one entry in the array may be marked `isDefault: true`.
+            When no entry is so marked, the entry at index 0 is the default.
+
+    FinOSAgentPortDeclaration:
+      type: object
+      required:
+        - name
+        - type
+      description: |
+        Static declaration of a single input or output port on a FinOS Agent.
+        Carried in `FinOSAgentExtensionParams.finOSInputSchema.ports` and
+        `finOSOutputSchema.ports`.
+
+        **Distinction from `FinOSVariableBinding`:**
+        `FinOSVariableBinding` is a *runtime* binding that carries an actual
+        value during a specific agent invocation. `FinOSAgentPortDeclaration`
+        is a *compile-time* schema that declares the port's name, type, and
+        constraints without carrying data.
+
+        The orchestrator uses port declarations to:
+        1. Validate agent wiring at **workflow-compile time** — misnamed keys
+           or type mismatches are caught before any execution occurs.
+        2. Auto-resolve `outputMapping` JSONPath expressions by port name,
+           eliminating hand-authored `$.task.output.*` strings.
+        3. Power binding UI in the visual workflow designer: field
+           suggestions, type badges, required-field warnings.
+      properties:
+        name:
+          type: string
+          pattern: '^[a-zA-Z_][a-zA-Z0-9_]*$'
+          maxLength: 128
+          description: |
+            Port name — must be a valid identifier. Used as the map key in
+            `FinOSAgentIOSchema.ports` and matches the variable name in
+            runtime `FinOSVariableBindings`.
+        type:
+          $ref: '#/components/schemas/VariableType'
+          description: The data type of the port's value.
+        description:
+          type: [string, "null"]
+          maxLength: 1024
+          description: Human-readable description of what this port represents.
+        required:
+          type: boolean
+          default: false
+          description: |
+            For **input** ports: if `true`, the agent MUST receive a non-null
+            value for this port to proceed; the orchestrator enforces this at
+            compile time and at invocation time.
+            For **output** ports: if `true`, the agent MUST populate this port
+            before completing; the orchestrator validates presence in the
+            returned task output.
+        dataClassification:
+          $ref: '#/components/schemas/DataClassification'
+          default: INTERNAL
+          description: |
+            Data classification label governing logging, redaction, and
+            policy enforcement for values flowing through this port.
+        constraints:
+          type: [object, "null"]
+          additionalProperties: true
+          description: |
+            Optional JSON Schema fragment further constraining the port's
+            value space. The orchestrator enforces constraints at compile
+            time (structural) and at invocation time (value bounds).
+            Examples:
+            - NUMBER port: `{"minimum": 0, "maximum": 1000000}`
+            - STRING port: `{"enum": ["VENDOR_INVOICE", "EXPENSE_REPORT"]}`
+            - ARRAY port:  `{"minItems": 1}`
+        examples:
+          type: [array, "null"]
+          items: {}
+          description: |
+            Representative example values. Used by the visual designer for
+            contextual hints and by the SDK for test generation.
+
+    FinOSAgentIOSchema:
+      type: object
+      description: |
+        Container for a FinOS Agent's static I/O contract — either the
+        complete set of input ports (`finOSInputSchema`) or output ports
+        (`finOSOutputSchema`).
+
+        ## Why this exists
+
+        The `FinOSAgent` DAG node historically compensated for the absence
+        of a machine-readable contract with `outputMapping` JSONPath
+        expressions (`$.task.output.outcome`). These reference an undeclared
+        structure and cause three concrete problems:
+
+        1. **No designer binding UI.** The visual workflow designer has no
+           schema to suggest fields, enforce types, or warn about wiring
+           mismatches. Bindings are written by convention and fail silently
+           at runtime.
+        2. **No compile-time wiring validation.** A misnamed output key or
+           wrong type isn't caught until the workflow executes against a live
+           agent.
+        3. **Fragile, redundant JSONPath.** `$.task.output.*` paths are
+           brittle strings that break when the agent's output shape changes.
+
+        When `finOSOutputSchema` is present, the orchestrator binds
+        downstream agents by port name directly, making `outputMapping`
+        expressions redundant for declared ports. The designer auto-populates
+        the binding UI from the declared port set.
+
+        ## Port map
+
+        `ports` is a flat map from port name to `FinOSAgentPortDeclaration`.
+        The same schema type is used for both input and output.
+      properties:
+        ports:
+          type: [object, "null"]
+          additionalProperties:
+            $ref: '#/components/schemas/FinOSAgentPortDeclaration'
+          description: |
+            Map of port name → port declaration.
+            Keys MUST match `FinOSAgentPortDeclaration.name` and follow the
+            identifier pattern `^[a-zA-Z_][a-zA-Z0-9_]*$`.
+            Example:
+            ```
+            {
+              "invoiceAmount": { "name": "invoiceAmount", "type": "NUMBER", ... },
+              "vendorId":      { "name": "vendorId",      "type": "UUID",   ... }
+            }
+            ```
+        schemaVersion:
+          type: [string, "null"]
+          description: |
+            Semver version of this I/O schema declaration. Increment when
+            ports are added, removed, or have their types changed. Used by
+            the orchestrator to detect stale wiring in persisted workflow
+            definitions.
+          example: "1.0"
+
+    FinOSAgentExtensionParams:
+      type: object
+      description: |
+        Typed parameter schema for the FinOS agent extension
+        (URI: `https://{vendor-domain}/finos/agent-card/v1`).
+
+        All FinOS-specific fields are carried inside `capabilities.extensions[].params`,
+        preserving full A2A protocol conformance alongside FinOS governance metadata.
+      properties:
+        finOSAgentId:
+          type: string
+          format: uuid
+          description: FinOS-specific globally unique agent ID.
+        finOSAgentType:
+          type: string
+          enum: [ORCHESTRATOR, PLANNER, EXECUTOR, REVIEWER, MONITOR, EXTRACTOR, CLASSIFIER, SUMMARIZER, CUSTOM]
+          description: The FinOS agent role classification.
+        finOSLlmModels:
+          type: array
+          items:
+            $ref: '#/components/schemas/FinOSLlmModelEntry'
+          minItems: 1
+          description: |
+            Ordered list of LLMs this agent may use, in descending priority order
+            (index 0 = primary / default model).
+
+            A composite agent that routes different sub-tasks to specialised
+            models declares all models here using `taskAffinity` annotations.
+            Sub-agents that do not publish their own Agent Card have their model
+            usage declared in the parent agent's `finOSLlmModels` list.
+
+            The orchestrator selects the model with the matching `taskAffinity`
+            for each sub-task invocation. If no match is found the entry with
+            `isDefault: true` (or index 0) is used.
+          example:
+            - modelId: claude-sonnet-4-6
+              provider: anthropic
+              isDefault: true
+              contextWindowTokens: 200000
+            - modelId: claude-haiku-4-5-20251001
+              provider: anthropic
+              taskAffinity: [DOCUMENT_EXTRACTION, LINE_ITEM_PARSING]
+              contextWindowTokens: 200000
+        finOSSupportedContextModes:
+          type: [array, "null"]
+          items:
+            $ref: '#/components/schemas/ContextGraphMode'
+          description: Context graph modes this agent can consume.
+        finOSPoliciesRequired:
+          type: [array, "null"]
+          items:
+            type: string
+          description: |
+            Policy types that callers MUST include in the `finOSPolicies` array
+            when invoking this agent via `POST /invoke`.
+          example: [APPROVAL, SPENDING_LIMIT]
+        finOSDAGNodeTypes:
+          type: [array, "null"]
+          items:
+            type: string
+          description: Types of DAG node this agent may be scheduled as.
+          example: [NodeInstance, FinOSAgentEvent]
+        finOSTenantId:
+          type: [string, "null"]
+          description: Tenant this agent is registered in.
+        finOSRegisteredAt:
+          type: [string, "null"]
+          format: date-time
+          readOnly: true
+
+        # ── I/O contract fields (Change B) ───────────────────────────────────
+
+        finOSInputSchema:
+          oneOf:
+            - $ref: '#/components/schemas/FinOSAgentIOSchema'
+            - type: "null"
+          description: |
+            Static schema of variables this agent expects as input.
+            Declared at registration time as a compile-time contract.
+
+            The orchestrator validates incoming `FinOSVariableBindings.inputs`
+            against this schema at **workflow-compile time**, not at execution
+            time. The visual workflow designer (React Flow / Overflow) uses
+            this schema to:
+
+            - Populate field suggestions when a tenant wires Agent A's output
+              to Agent B's input.
+            - Enforce type compatibility and `required` checks before the
+              workflow definition is saved.
+            - Auto-generate default `inputMapping` entries by variable name,
+              reducing manual JSONPath authoring.
+
+            When `null`, the agent declares no static input contract and the
+            orchestrator skips compile-time binding validation for this agent.
+
+        finOSOutputSchema:
+          oneOf:
+            - $ref: '#/components/schemas/FinOSAgentIOSchema'
+            - type: "null"
+          description: |
+            Static schema of variables this agent guarantees to produce.
+            Declared at registration time as a compile-time contract.
+
+            When present, the orchestrator **binds downstream agents by
+            variable name directly**, making `outputMapping` JSONPath
+            expressions redundant for well-declared agents. Specifically:
+
+            - The workflow compiler resolves `$.task.output.{portName}` paths
+              automatically from the declared port names, eliminating the need
+              for hand-authored JSONPath strings.
+            - The visual designer populates the output-side of the binding UI
+              with the declared port names and types.
+            - A misnamed binding key or type mismatch is caught at
+              **compile time**, not at first execution against a live agent.
+
+            When `null`, the agent declares no static output contract and the
+            orchestrator falls back to runtime `outputMapping` evaluation.
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # § A2A AGENT CARD (FinOS Discovery Document)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    FinOSAgentCard:
+      type: object
+      required:
+        - name
+        - description
+        - version
+        - skills
+        - supportedInterfaces
+        - capabilities
+        - defaultInputModes
+        - defaultOutputModes
+      description: |
+        A2A Agent Card served at `/.well-known/agent-card.json`. Conforms to the
+        A2A Agent Card specification extended with FinOS governance metadata.
+
+        **FinOS extension pattern:** All FinOS-specific fields (`finOSAgentId`,
+        `finOSAgentType`, `finOSLlmModels`, `finOSSupportedContextModes`, etc.) are carried
+        inside `capabilities.extensions[]` under the URI `https://{vendor-domain}/finos/agent-card/v1`
+        with `required: true`. The `params` of that entry conform to `FinOSAgentExtensionParams`.
+
+        This is the discovery document. Invocation uses standard A2A `Message` objects
+        delivered to the agent's `supportedInterfaces[].url`, with FinOS governance
+        data in `Message.metadata.finos.*`.
+      properties:
+        # ── Standard A2A fields ──────────────────────────────────────────────
+        name:
+          type: string
+          description: Human-readable agent name (A2A `name`).
+        description:
+          type: string
+          description: What this agent does (A2A `description`).
+        version:
+          type: string
+          description: Agent version (A2A `version`).
+          example: "2.1.0"
+        documentationUrl:
+          type: [string, "null"]
+          format: uri
+          description: Link to agent-specific API documentation.
+        provider:
+          $ref: '#/components/schemas/AgentProvider'
+          description: Organization that provides this agent.
+        supportedInterfaces:
+          type: array
+          description: |
+            A2A `supportedInterfaces` — defines the protocol bindings available
+            for communicating with this agent. Each entry specifies a URL and
+            protocol binding (JSONRPC, GRPC, HTTP+JSON).
+          items:
+            $ref: '#/components/schemas/AgentInterface'
+        capabilities:
+          type: object
+          description: A2A capability flags and FinOS extension declarations.
+          properties:
+            streaming:
+              type: boolean
+              default: false
+              description: Whether this agent supports SSE streaming responses.
+            pushNotifications:
+              type: boolean
+              default: false
+              description: Whether this agent supports async push notifications.
+            stateTransitionHistory:
+              type: boolean
+              default: true
+              description: Whether the agent exposes task state transition history.
+            extensions:
+              type: [array, "null"]
+              description: |
+                A2A-compatible extension declarations. FinOS agents MUST include
+                exactly one entry with `uri: "https://{vendor-domain}/finos/agent-card/v1"`
+                and `required: true`. The `params` of that entry conform to
+                `FinOSAgentExtensionParams`.
+              items:
+                $ref: '#/components/schemas/AgentExtension'
+        securitySchemes:
+          type: object
+          description: |
+            A2A security scheme definitions (map of scheme name to SecurityScheme).
+            Follows the A2A `securitySchemes` pattern.
+          additionalProperties:
+            $ref: '#/components/schemas/SecurityScheme'
+        securityRequirements:
+          type: array
+          description: |
+            A2A security requirements. Each entry is an object mapping scheme
+            names to required scopes. At least one entry must be satisfied.
+          items:
+            type: object
+            additionalProperties:
+              type: array
+              items:
+                type: string
+          example:
+            - bearerAuth: ["finos:agent:invoke"]
+        defaultInputModes:
+          type: array
+          items:
+            $ref: '#/components/schemas/A2AInputMode'
+          example: [text, data]
+        defaultOutputModes:
+          type: array
+          items:
+            $ref: '#/components/schemas/A2AOutputMode'
+          example: [data]
+        skills:
+          type: array
+          description: |
+            A2A skills — REQUIRED. Declares what this agent can do.
+            Each skill describes a capability with optional examples.
+          items:
+            type: object
+            required: [id, name]
+            properties:
+              id:
+                type: string
+              name:
+                type: string
+              description:
+                type: string
+              tags:
+                type: array
+                items:
+                  type: string
+              examples:
+                type: array
+                items:
+                  type: string
+              inputModes:
+                type: array
+                items:
+                  $ref: '#/components/schemas/A2AInputMode'
+              outputModes:
+                type: array
+                items:
+                  $ref: '#/components/schemas/A2AOutputMode'
+
+    AgentInterface:
+      type: object
+      required:
+        - url
+        - protocolBinding
+      description: |
+        A2A `AgentInterface` — describes a protocol binding endpoint
+        for communicating with this agent.
+      properties:
+        url:
+          type: string
+          format: uri
+          description: Endpoint URL for this interface.
+        protocolBinding:
+          type: string
+          enum:
+            - JSONRPC      # JSON-RPC 2.0 (standard A2A)
+            - GRPC         # gRPC protocol
+            - "HTTP+JSON"  # HTTP with JSON payloads
+          description: Wire protocol used at this endpoint.
+        protocolVersion:
+          type: string
+          description: Protocol version (e.g. "1.0" for A2A v1).
+        tenant:
+          type: string
+          description: Tenant identifier if this interface is tenant-scoped.
+
+    SecurityScheme:
+      type: object
+      required:
+        - type
+      description: |
+        A2A SecurityScheme — mirrors OpenAPI SecurityScheme.
+        Used in `FinOSAgentCard.securitySchemes`.
+      properties:
+        type:
+          type: string
+          enum: [http, apiKey, oauth2, openIdConnect]
+          description: Security scheme type.
+        in:
+          type: [string, "null"]
+          enum: [header, query, cookie, null]
+          description: Location of the API key (when type=apiKey).
+        name:
+          type: [string, "null"]
+          description: Name of the header, query, or cookie parameter (when type=apiKey).
+        scheme:
+          type: [string, "null"]
+          description: HTTP auth scheme name (when type=http), e.g. "bearer".
+        bearerFormat:
+          type: [string, "null"]
+          description: Bearer token format hint, e.g. "JWT".
+        flows:
+          type: [object, "null"]
+          description: OAuth 2.0 flows (when type=oauth2).
+          additionalProperties: true
+        openIdConnectUrl:
+          type: [string, "null"]
+          format: uri
+          description: OpenID Connect discovery URL (when type=openIdConnect).
+
+    AgentProvider:
+      type: object
+      description: |
+        A2A `AgentProvider` — organization that provides this agent.
+      properties:
+        organization:
+          type: string
+          description: Name of the providing organization.
+          example: "Example Corp"
+        url:
+          type: string
+          format: uri
+          description: URL of the provider's website or agent registry.
+          example: "https://www.example.com"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # § FINOS MESSAGE METADATA (carried in A2A Message.metadata.finos)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    FinOSMessageMetadata:
+      type: object
+      description: |
+        FinOS governance metadata carried in `Message.metadata.finos` of A2A messages.
+        Replaces the legacy invocation envelope — all runtime context for a FinOS agent
+        invocation is carried here within the standard A2A Message structure.
+
+        The SDK provides Pydantic validation for this schema via
+        `FinOSMessageMetadata.model_validate()`.
+      properties:
+        callingContext:
+          $ref: '#/components/schemas/FinOSCallingContext'
+          description: |
+            WHO is calling this agent and in what workflow/execution context.
+            Controls RBAC enforcement, policy selection, and DAG position tracking.
+        additionalUserPrompt:
+          oneOf:
+            - $ref: '#/components/schemas/FinOSAdditionalPrompt'
+            - type: "null"
+          description: |
+            Optional additional prompt injected by the caller into the agent's
+            context window. If null, the agent uses only its base system prompt.
+        contextGraphs:
+          type: [array, "null"]
+          description: |
+            Ordered array of context graph payloads in one or more modes.
+            Multiple graphs may coexist (e.g. a RAG_QUERY for live facts
+            AND a RAG_TENSOR for a pre-computed policy embedding).
+            Assembled into context in ascending `rank` order.
+          items:
+            $ref: '#/components/schemas/FinOSContextGraph'
+        policies:
+          type: [array, "null"]
+          description: |
+            FinOS policy instances governing this agent's execution.
+            The agent evaluates ALL policies PRE-EXECUTION. Any BLOCK-mode
+            policy failure halts execution and emits a FinOSPolicyEvent.
+          items:
+            $ref: '#/components/schemas/FinOSAgentPolicy'
+        variables:
+          oneOf:
+            - $ref: '#/components/schemas/FinOSVariableBindings'
+            - type: "null"
+          description: |
+            Input and output variable bindings for this invocation.
+            Input variables are read at execution start; output variable
+            templates are populated by the agent on completion.
+        sessionContextStore:
+          oneOf:
+            - $ref: '#/components/schemas/FinOSSessionContextStoreRef'
+            - type: "null"
+          description: |
+            Reference to the shared in-session context store. The agent reads
+            input variable bindings and writes output variable bindings to this
+            store. If null, the agent operates statelessly.
+
+    FinOSVariableBindings:
+      type: object
+      description: |
+        Combined input/output variable bindings for a FinOS agent invocation.
+        Carried in `Message.metadata.finos.variables`.
+      properties:
+        inputs:
+          $ref: '#/components/schemas/FinOSAgentInputVariables'
+          description: Input variables passed to the agent.
+        outputs:
+          $ref: '#/components/schemas/FinOSAgentOutputVariables'
+          description: Output variable templates populated by the agent.
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # § ERRORS
+    # ──────────────────────────────────────────────────────────────────────────
+
+    Problem:
+      type: object
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          format: uri
+          example: "https://{api-host}/finos/errors/not-found"
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: [string, "null"]
+        instance:
+          type: [string, "null"]
+          format: uri-reference
+        traceId:
+          type: [string, "null"]
+        timestamp:
+          type: string
+          format: date-time
+        errors:
+          type: [array, "null"]
+          items:
+            type: object
+            properties:
+              field:
+                type: string
+              code:
+                type: string
+              message:
+                type: string
+
+    PolicyViolationProblem:
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          properties:
+            policyViolations:
+              type: array
+              items:
+                type: object
+                properties:
+                  policyId:
+                    type: string
+                    format: uuid
+                  policyName:
+                    type: string
+                  failedRuleId:
+                    type: string
+                  outcome:
+                    type: string
+                    enum: [Escalate, AttentionRequired, Failed]
+                  escalationRole:
+                    type: [string, "null"]
+
+  # ── Examples ───────────────────────────────────────────────────────────────
+  examples:
+
+    WorkflowNodeMessageExample:
+      summary: Workflow engine sending an A2A message with FinOS metadata
+      value:
+        messageId: "msg-0001-0000-0000-0000-000000000001"
+        contextId: "ctx-0001-0000-0000-0000-000000000001"
+        role: user
+        parts:
+          - kind: text
+            text: |
+              Classify the attached invoice. Extract: vendor name, invoice number,
+              line items with amounts, total amount, due date. Flag any amount
+              exceeding $50,000 for escalation per the SPENDING_LIMIT policy.
+          - kind: data
+            data:
+              invoicePdf: "JVBERi0xLjQKJeLjz9MK..."
+              vendorId: "vendor-0001-0000-0000-0000-000000000001"
+        metadata:
+          finos:
+            callingContext:
+              callerId: "eng-0000-0000-0000-0000-000000000001"
+              callerType: WORKFLOW_ENGINE
+              callerRole: "system-orchestrator"
+              sessionId: "sess-0000-0000-0000-0000-000000000001"
+              workflowInstanceId: "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+              workflowDefinitionId: "def-0000-0000-0000-0000-000000000001"
+              nodeInstanceId: "node-0001-0000-0000-0000-000000000003"
+              dagDepth: 2
+              correlationId: "corr-0000-0000-0000-0000-000000000001"
+              traceId: "0af7651916cd43dd8448eb211c80319c"
+              spanId: "b7ad6b7169203331"
+              executionPriority: HIGH
+              maxExecutionMs: 30000
+            contextGraphs:
+              - contextGraphId: "ctx-0001-0000-0000-0000-000000000001"
+                mode: RAG_QUERY
+                rank: 0
+                description: "Vendor master data retrieval"
+                ragQuery:
+                  vectorStoreId: "vs-vendors-0001"
+                  vectorStoreUri: "https://pinecone.erp.internal/vendor-master"
+                  queryText: "vendor invoice payment terms approval thresholds"
+                  embeddingModel: "text-embedding-3-large"
+                  topK: 10
+                  similarityThreshold: 0.80
+                  namespace: "vendor-master-prod"
+                  metadataFilter:
+                    tenantId: "tenant-acme-prod"
+                    dataType: "vendor_profile"
+            policies:
+              - policyId: "pol-spending-limit-v3"
+                policyName: "Spending Limit Gate"
+                policyVersion: "3.0.0"
+                policyType: SPENDING_LIMIT
+                enforcementMode: BLOCK
+                escalationRole: "finance-manager"
+                rules:
+                  - ruleId: "rule-amount-threshold"
+                    ruleExpression: "inputVariables.invoiceAmount <= 50000"
+                    ruleDescription: "Invoices over $50,000 require finance-manager approval"
+                    severity: ERROR
+                effectiveDate: "2026-01-01"
+            variables:
+              inputs:
+                variables:
+                  uploadedInvoicePdf:
+                    variableId: "var-0001"
+                    name: uploadedInvoicePdf
+                    type: BINARY
+                    value: "JVBERi0xLjQKJeLjz9MK..."
+                    dataClassification: CONFIDENTIAL
+                    required: true
+                    storeKey: "uploadedInvoicePdf"
+              outputs:
+                variables:
+                  invoiceClassification:
+                    variableId: "var-out-0001"
+                    name: invoiceClassification
+                    type: OBJECT
+                    value: null
+                    dataClassification: INTERNAL
+                    required: true
+                    storeKey: "invoiceClassification"
+            sessionContextStore:
+              storeId: "store-0001-0000-0000-0000-000000000001"
+              storeType: REDIS
+              storeUri: "redis://session-store.erp.internal:6379"
+              namespace: "tenant-acme-prod/3fa85f64-.../sess-0000-..."
+              accessMode: READ_WRITE
+              credentialRef: "cred-0001-0000-0000-0000-000000000001"
+              ttlSeconds: 7200
+              readKeys: ["uploadedInvoicePdf", "vendorId"]
+        extensions:
+          - "https://{vendor-domain}/finos/agent-card/v1"
+
+    AgentToAgentMessageExample:
+      summary: Orchestrator agent delegating a sub-task via A2A message
+      value:
+        messageId: "msg-0002-0000-0000-0000-000000000002"
+        contextId: "ctx-0001-0000-0000-0000-000000000001"
+        taskId: "task-0001-0000-0000-0000-000000000001"
+        role: user
+        parts:
+          - kind: text
+            text: |
+              Validate the invoice total against the line items sum.
+              Flag any discrepancy greater than $0.01 as an anomaly.
+        metadata:
+          finos:
+            callingContext:
+              callerId: "agt-orchestrator-0001"
+              callerType: AGENT
+              callerRole: "invoice-processor"
+              sessionId: "sess-0000-0000-0000-0000-000000000001"
+              workflowInstanceId: "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+              nodeInstanceId: "node-0002-0000-0000-0000-000000000004"
+              dagDepth: 3
+              parentAgentId: "agt-orchestrator-0001"
+              correlationId: "corr-0000-0000-0000-0000-000000000001"
+              executionPriority: NORMAL
+            variables:
+              inputs:
+                variables:
+                  invoiceClassification:
+                    variableId: "var-in-0001"
+                    name: invoiceClassification
+                    type: OBJECT
+                    value: null
+                    dataClassification: INTERNAL
+                    required: true
+                    storeKey: "invoiceClassification"
+            sessionContextStore:
+              storeId: "store-0001-0000-0000-0000-000000000001"
+              storeType: REDIS
+              storeUri: "redis://session-store.erp.internal:6379"
+              namespace: "tenant-acme-prod/3fa85f64-.../sess-0000-..."
+              accessMode: READ
+              credentialRef: "cred-0001-0000-0000-0000-000000000001"
+              readKeys: ["invoiceClassification"]
+
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT issued by the platform identity provider (OAuth 2.0 / OIDC).
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-FinOS-API-Key
+      description: Service-to-service API key.
+
+security:
+  - BearerAuth: []
+  - ApiKeyAuth: []

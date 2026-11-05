@@ -1,0 +1,2323 @@
+openapi: 3.1.0
+
+info:
+  title: FinOS Workflow Execution History API
+  version: 1.0.0
+  description: |
+    Append-only and graph-query REST APIs for **FinOSWorkflowExecutionHistory** — a directed
+    acyclic graph (DAG) of `FinOSVertex` nodes connected by typed `FinOSEdge` relations.
+
+    Designed for the **Blackline Agentic AI Orchestration Platform** (FinOS layer).
+
+    ### Append-Only Audit Contract
+    An execution history is a SOX audit record, so this API deliberately exposes **no**
+    `PUT`, `PATCH`, or `DELETE` operation on an instance, a vertex, or an edge. The only
+    writes are:
+
+    - `POST` — append a new instance, vertex, or edge.
+    - `PATCH /workflow-executions/{instanceId}/status` — a validated lifecycle transition
+      on the instance envelope (`executionStatus`, `executionEndTime`, `reason`). It never
+      alters an existing vertex or edge.
+
+    Correcting a recorded fact means appending a superseding vertex and linking it, so that
+    the correction is itself visible in the audit trail. Retiring an instance means
+    transitioning it to `ARCHIVED`, which retains all data. Retention expiry and statutory
+    erasure are operator actions at the storage layer, outside this API and under separate
+    authorisation. An implementation that adds replace or delete operations to this surface
+    is not conforming.
+
+    ### CloudEvent Compliance
+    All `FinOSEvent`-family vertices fully implement the
+    [CloudEvents v1.0 specification](https://github.com/cloudevents/spec). The required
+    CloudEvent attributes (`id`, `source`, `specversion`, `type`) are present on every
+    event vertex, extended with FinOS-specific properties.
+
+    ### Graph Model
+    ```
+    FinOSWorkflowExecutionHistory
+      ├── finOSVertices[]  (nodes of the DAG)
+      └── finOSEdges[]     (directed, typed edges)
+
+    FinOSVertex hierarchy:
+      WorkflowDefinition | WorkflowVersion | Execution | NodeInstance |
+      EdgeEvaluation | FinOSAgentEvent | FinOSAPIEvent | FinOSHITLEvent |
+      FinOSPolicyEvent | FinOSPolicy | ApprovalTier | Artifact |
+      Dataset | Exception | ExternalSystem
+    ```
+    ## Namespace Placeholders
+
+    Examples in this document use `{vendor-domain}`, `{event-namespace}`,
+    `{source-root}` and `{api-host}` where a wire identifier must live in a
+    namespace the implementation controls. Substitute all four consistently at
+    deployment time; the structure after the namespace root is normative. See
+    README §3.4.
+  contact:
+    name: Blackline Platform Engineering
+    email: platform-eng@blackline.com
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+servers:
+  - url: https://api.example.com/finos/v1
+    description: Production
+  - url: https://api-staging.example.com/finos/v1
+    description: Staging
+  - url: http://localhost:8080/finos/v1
+    description: Local development
+
+tags:
+  - name: Execution History
+    description: Read, append, and status-transition operations on FinOSWorkflowExecutionHistory instances
+  - name: Vertices
+    description: Read and append operations on FinOSVertex nodes within an execution history
+  - name: Edges
+    description: Read and append operations on FinOSEdge relations within an execution history
+  - name: Graph
+    description: DAG-level graph query and traversal operations
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PATHS
+# ══════════════════════════════════════════════════════════════════════════════
+paths:
+
+  # ── Execution History Collection ─────────────────────────────────────────
+  /workflow-executions:
+
+    get:
+      operationId: listExecutionHistories
+      summary: List execution histories
+      tags: [Execution History]
+      description: Returns a paginated list of `FinOSWorkflowExecutionHistory` instances.
+        Supports filtering by status, date range, and the FinOS `filter` expression.
+      parameters:
+        - $ref: '#/components/parameters/FilterParam'
+        - $ref: '#/components/parameters/SortParam'
+        - $ref: '#/components/parameters/SortOrderParam'
+        - $ref: '#/components/parameters/PageSizeParam'
+        - $ref: '#/components/parameters/PageStartIndexParam'
+        - name: executionStatus
+          in: query
+          description: Filter by execution status.
+          schema:
+            $ref: '#/components/schemas/ExecutionStatus'
+        - name: fromDate
+          in: query
+          description: Filter instances where executionStartTime ≥ this value (ISO 8601).
+          schema:
+            type: string
+            format: date-time
+        - name: toDate
+          in: query
+          description: Filter instances where executionStartTime ≤ this value (ISO 8601).
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: Paginated list of execution histories.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExecutionHistoryListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    post:
+      operationId: createExecutionHistory
+      summary: Create an execution history
+      tags: [Execution History]
+      description: |
+        Creates a new `FinOSWorkflowExecutionHistory` instance. The DAG may be
+        populated at creation time by including `finOSVertices` and `finOSEdges`,
+        or built incrementally via the `/vertices` and `/edges` sub-resources.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FinOSWorkflowExecutionHistoryCreate'
+            examples:
+              minimal:
+                $ref: '#/components/examples/MinimalCreateRequest'
+              withGraph:
+                $ref: '#/components/examples/CreateWithGraphRequest'
+      responses:
+        '201':
+          description: Execution history created.
+          headers:
+            Location:
+              description: URL of the newly created resource.
+              schema:
+                type: string
+                format: uri
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExecutionHistorySingleResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ── Execution History Item ────────────────────────────────────────────────
+  /workflow-executions/{instanceId}:
+
+    parameters:
+      - $ref: '#/components/parameters/InstanceIdParam'
+
+    get:
+      operationId: getExecutionHistory
+      summary: Get an execution history by ID
+      tags: [Execution History]
+      description: Retrieves a single `FinOSWorkflowExecutionHistory` instance including
+        all vertices and edges unless pagination is requested via `?embed`.
+      parameters:
+        - name: embed
+          in: query
+          description: |
+            Controls embedding of sub-resources.
+            - `none` — return header fields only (instanceId, status, times).
+            - `vertices` — embed vertices only.
+            - `edges` — embed edges only.
+            - `full` (default) — embed both vertices and edges.
+          schema:
+            type: string
+            enum: [none, vertices, edges, full]
+            default: full
+      responses:
+        '200':
+          description: Execution history found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExecutionHistorySingleResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ── Status sub-resource ───────────────────────────────────────────────────
+  /workflow-executions/{instanceId}/status:
+
+    parameters:
+      - $ref: '#/components/parameters/InstanceIdParam'
+
+    patch:
+      operationId: updateExecutionStatus
+      summary: Update execution status
+      tags: [Execution History]
+      description: |
+        Dedicated endpoint for lifecycle state transitions. Validates allowed
+        transitions (e.g. RUNNING → COMPLETED, RUNNING → FAILED).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [executionStatus]
+              properties:
+                executionStatus:
+                  $ref: '#/components/schemas/ExecutionStatus'
+                executionEndTime:
+                  type: string
+                  format: date-time
+                  description: Required when transitioning to COMPLETED or FAILED.
+                reason:
+                  type: string
+                  maxLength: 512
+                  description: Human-readable reason for the status change.
+      responses:
+        '200':
+          description: Status updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExecutionHistorySingleResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Invalid state transition.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ── Vertex Collection ─────────────────────────────────────────────────────
+  /workflow-executions/{instanceId}/vertices:
+
+    parameters:
+      - $ref: '#/components/parameters/InstanceIdParam'
+
+    get:
+      operationId: listVertices
+      summary: List vertices
+      tags: [Vertices]
+      description: Returns a paginated list of all `FinOSVertex` nodes in the DAG.
+      parameters:
+        - $ref: '#/components/parameters/PageSizeParam'
+        - $ref: '#/components/parameters/PageStartIndexParam'
+        - name: vertexType
+          in: query
+          description: Filter by vertex type.
+          schema:
+            $ref: '#/components/schemas/FinOSVertexType'
+      responses:
+        '200':
+          description: Paginated list of vertices.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VertexListResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    post:
+      operationId: addVertex
+      summary: Add a vertex to the DAG
+      tags: [Vertices]
+      description: |
+        Adds a new `FinOSVertex` node to the DAG. The `vertexType` discriminator
+        determines the concrete schema to validate against.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FinOSVertex'
+      responses:
+        '201':
+          description: Vertex created.
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VertexSingleResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ── Vertex Item ───────────────────────────────────────────────────────────
+  /workflow-executions/{instanceId}/vertices/{vertexId}:
+
+    parameters:
+      - $ref: '#/components/parameters/InstanceIdParam'
+      - $ref: '#/components/parameters/VertexIdParam'
+
+    get:
+      operationId: getVertex
+      summary: Get a vertex by ID
+      tags: [Vertices]
+      responses:
+        '200':
+          description: Vertex found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VertexSingleResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ── Edges of a specific vertex ────────────────────────────────────────────
+  /workflow-executions/{instanceId}/vertices/{vertexId}/edges:
+
+    parameters:
+      - $ref: '#/components/parameters/InstanceIdParam'
+      - $ref: '#/components/parameters/VertexIdParam'
+
+    get:
+      operationId: getVertexEdges
+      summary: Get edges connected to a vertex
+      tags: [Vertices]
+      description: Returns all edges where the given vertex is either the source or target.
+      parameters:
+        - name: direction
+          in: query
+          description: |
+            - `outgoing` — edges originating from this vertex.
+            - `incoming` — edges terminating at this vertex.
+            - `both` (default) — all incident edges.
+          schema:
+            type: string
+            enum: [outgoing, incoming, both]
+            default: both
+        - name: edgeType
+          in: query
+          description: Filter by edge type.
+          schema:
+            $ref: '#/components/schemas/FinOSEdgeType'
+      responses:
+        '200':
+          description: List of incident edges.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EdgeListResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ── Edge Collection ───────────────────────────────────────────────────────
+  /workflow-executions/{instanceId}/edges:
+
+    parameters:
+      - $ref: '#/components/parameters/InstanceIdParam'
+
+    get:
+      operationId: listEdges
+      summary: List edges
+      tags: [Edges]
+      description: Returns a paginated list of all `FinOSEdge` relations in the DAG.
+      parameters:
+        - $ref: '#/components/parameters/PageSizeParam'
+        - $ref: '#/components/parameters/PageStartIndexParam'
+        - name: edgeType
+          in: query
+          description: Filter by edge type.
+          schema:
+            $ref: '#/components/schemas/FinOSEdgeType'
+        - name: sourceVertexId
+          in: query
+          description: Filter edges by source vertex ID.
+          schema:
+            type: string
+            format: uuid
+        - name: targetVertexId
+          in: query
+          description: Filter edges by target vertex ID.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Paginated list of edges.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EdgeListResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    post:
+      operationId: addEdge
+      summary: Add an edge to the DAG
+      tags: [Edges]
+      description: |
+        Adds a directed `FinOSEdge` between two existing vertices. The API validates
+        that adding this edge does not create a cycle (DAG invariant).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FinOSEdge'
+      responses:
+        '201':
+          description: Edge created.
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EdgeSingleResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Edge would create a cycle in the DAG.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ── Edge Item ─────────────────────────────────────────────────────────────
+  /workflow-executions/{instanceId}/edges/{edgeId}:
+
+    parameters:
+      - $ref: '#/components/parameters/InstanceIdParam'
+      - $ref: '#/components/parameters/EdgeIdParam'
+
+    get:
+      operationId: getEdge
+      summary: Get an edge by ID
+      tags: [Edges]
+      responses:
+        '200':
+          description: Edge found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EdgeSingleResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ── Vertices of a specific edge ───────────────────────────────────────────
+  /workflow-executions/{instanceId}/edges/{edgeId}/vertices:
+
+    parameters:
+      - $ref: '#/components/parameters/InstanceIdParam'
+      - $ref: '#/components/parameters/EdgeIdParam'
+
+    get:
+      operationId: getEdgeVertices
+      summary: Get vertices connected by an edge
+      tags: [Edges]
+      description: Returns the source and target vertices for a given edge.
+      responses:
+        '200':
+          description: Source and target vertices.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      sourceVertex:
+                        $ref: '#/components/schemas/FinOSVertex'
+                      targetVertex:
+                        $ref: '#/components/schemas/FinOSVertex'
+                  meta:
+                    $ref: '#/components/schemas/ResponseMeta'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ── Graph Operations ──────────────────────────────────────────────────────
+  /workflow-executions/{instanceId}/graph:
+
+    parameters:
+      - $ref: '#/components/parameters/InstanceIdParam'
+
+    get:
+      operationId: getGraph
+      summary: Get the full DAG
+      tags: [Graph]
+      description: |
+        Returns the complete DAG representation for the execution history,
+        including all vertices and edges in a graph-optimised payload suitable
+        for rendering (e.g. via D3, Cytoscape, or Graphviz).
+      parameters:
+        - name: format
+          in: query
+          description: |
+            Response graph format:
+            - `adjacency` (default) — adjacency list per vertex.
+            - `edgelist` — flat edge list with vertex stubs.
+            - `cytoscape` — Cytoscape.js elements format.
+          schema:
+            type: string
+            enum: [adjacency, edgelist, cytoscape]
+            default: adjacency
+      responses:
+        '200':
+          description: Full DAG representation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraphResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /workflow-executions/{instanceId}/graph/traverse:
+
+    parameters:
+      - $ref: '#/components/parameters/InstanceIdParam'
+
+    post:
+      operationId: traverseGraph
+      summary: Traverse the DAG from a starting vertex
+      tags: [Graph]
+      description: |
+        Performs a depth-first or breadth-first traversal of the DAG starting
+        from a given vertex. Returns the ordered sequence of visited vertices and
+        edges up to the requested depth.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TraverseRequest'
+      responses:
+        '200':
+          description: Traversal result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TraverseResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /workflow-executions/{instanceId}/graph/path:
+
+    parameters:
+      - $ref: '#/components/parameters/InstanceIdParam'
+
+    get:
+      operationId: findPath
+      summary: Find path between two vertices
+      tags: [Graph]
+      description: |
+        Returns the shortest directed path between `sourceVertexId` and
+        `targetVertexId` in the DAG. Returns 404 if no path exists.
+      parameters:
+        - name: sourceVertexId
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: targetVertexId
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Shortest path found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PathResponse'
+        '404':
+          description: No path exists between the given vertices.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+# ══════════════════════════════════════════════════════════════════════════════
+# COMPONENTS
+# ══════════════════════════════════════════════════════════════════════════════
+components:
+
+  # ── Parameters ─────────────────────────────────────────────────────────────
+  parameters:
+
+    InstanceIdParam:
+      name: instanceId
+      in: path
+      required: true
+      description: Unique identifier of the FinOSWorkflowExecutionHistory instance.
+      schema:
+        type: string
+        format: uuid
+        example: 3fa85f64-5717-4562-b3fc-2c963f66afa6
+
+    VertexIdParam:
+      name: vertexId
+      in: path
+      required: true
+      description: Unique identifier of the FinOSVertex.
+      schema:
+        type: string
+        format: uuid
+
+    EdgeIdParam:
+      name: edgeId
+      in: path
+      required: true
+      description: Unique identifier of the FinOSEdge.
+      schema:
+        type: string
+        format: uuid
+
+    FilterParam:
+      name: filter
+      in: query
+      required: false
+      description: |
+        FinOS standard filter expression.
+        Syntax: `field operator "value"` optionally joined by `and`.
+        Operators: `contains` (case-insensitive substring), `eq` (exact equality).
+        Supported fields: `instanceId`, `workflowId`, `executionStatus`, `tenantId`, `triggeredBy`.
+      schema:
+        type: string
+      examples:
+        instance_contains:
+          value: 'instanceId contains "invoice"'
+        status_eq:
+          value: 'executionStatus eq "FAILED"'
+        compound:
+          value: 'tenantId eq "tenant-acme-prod" and executionStatus eq "RUNNING"'
+
+    SortParam:
+      name: sort
+      in: query
+      description: Field to sort by.
+      schema:
+        type: string
+        enum: [executionStartTime, executionEndTime, executionStatus, instanceId]
+        default: executionStartTime
+
+    SortOrderParam:
+      name: sortOrder
+      in: query
+      description: Sort direction.
+      schema:
+        type: string
+        enum: [asc, desc]
+        default: desc
+
+    PageSizeParam:
+      name: pageSize
+      in: query
+      description: Number of results per page (1–200).
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 20
+
+    PageStartIndexParam:
+      name: pageStartIndex
+      in: query
+      description: Zero-based start index for pagination.
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+
+  # ── Responses ──────────────────────────────────────────────────────────────
+  responses:
+
+    BadRequest:
+      description: Bad request — invalid parameters or malformed body.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    Unauthorized:
+      description: Authentication credentials missing or invalid.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    Forbidden:
+      description: Authenticated but not authorised for this operation.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    NotFound:
+      description: The requested resource was not found.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    Conflict:
+      description: Conflict — resource already exists or invariant violated.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    UnprocessableEntity:
+      description: Unprocessable entity — schema validation failed.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    InternalError:
+      description: Unexpected internal server error.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  # ── Schemas ────────────────────────────────────────────────────────────────
+  schemas:
+
+    # ── Enumerations ──────────────────────────────────────────────────────────
+
+    ExecutionStatus:
+      type: string
+      enum:
+        - PENDING
+        - RUNNING
+        - COMPLETED
+        - FAILED
+        - CANCELLED
+        - PAUSED
+        - ARCHIVED
+        - POLICY_BLOCKED
+      description: Lifecycle state of a FinOSWorkflowExecutionHistory instance.
+
+    FinOSVertexType:
+      type: string
+      enum:
+        - WorkflowDefinition
+        - WorkflowVersion
+        - Execution
+        - NodeInstance
+        - EdgeEvaluation
+        - FinOSAgentEvent
+        - FinOSAPIEvent
+        - FinOSHITLEvent
+        - FinOSPolicyEvent
+        - FinOSPolicy
+        - ApprovalTier
+        - Artifact
+        - Dataset
+        - Exception
+        - ExternalSystem
+      description: Discriminator for the polymorphic FinOSVertex type hierarchy.
+
+    FinOSEdgeType:
+      type: string
+      enum:
+        - EXECUTES
+        - CONTAINS_NODE
+        - FOLLOWED_BY
+        - EVALUATED_EDGE
+        - USED_POLICY
+        - CALLED_TOOL
+        - READ_OBJECT
+        - PROPOSED_ACTION_ON
+        - WAITED_FOR
+        - APPROVED_BY
+        - REJECTED_BY
+        - OVERRIDDEN_BY
+        - GENERATED_ARTIFACT
+        - TRIGGERED_BY
+        - RESUMED_BY
+        - POSTED_TO
+        - LINKED_TO_EXCEPTION
+        - DERIVED_FROM
+      description: Typed relation connecting two FinOSVertex nodes in the DAG.
+
+    FinOSEventType:
+      type: string
+      enum:
+        - FinOSAgentEvent
+        - FinOSAPIEvent
+        - FinOSHITLEvent
+        - FinOSPolicyEvent
+      description: Sub-type discriminator for FinOSEvent vertex types.
+
+    FinOSPolicyEvaluationOutcome:
+      type: string
+      enum:
+        - Success
+        - Escalate
+        - AttentionRequired
+        - Failed
+      description: Outcome of a FinOS policy evaluation step.
+
+    AgentType:
+      type: string
+      enum:
+        - ORCHESTRATOR
+        - PLANNER
+        - EXECUTOR
+        - REVIEWER
+        - MONITOR
+        - EXTRACTOR
+        - CLASSIFIER
+        - SUMMARIZER
+        - CUSTOM
+
+    TriggerType:
+      type: string
+      enum:
+        - MANUAL
+        - SCHEDULED
+        - EVENT_DRIVEN
+        - API
+        - WEBHOOK
+
+    ArtifactType:
+      type: string
+      enum:
+        - DOCUMENT
+        - REPORT
+        - FILE
+        - DATASET
+        - MODEL
+        - CODE
+        - IMAGE
+        - VIDEO
+        - AUDIO
+
+    DataClassification:
+      type: string
+      enum:
+        - PUBLIC
+        - INTERNAL
+        - CONFIDENTIAL
+        - RESTRICTED
+
+    ExternalSystemType:
+      type: string
+      enum:
+        - DATABASE
+        - REST_API
+        - GRAPHQL_API
+        - MESSAGE_QUEUE
+        - EVENT_STREAM
+        - FILE_SYSTEM
+        - LEGACY_SYSTEM
+        - DATA_WAREHOUSE
+
+    AuthType:
+      type: string
+      enum:
+        - NONE
+        - BASIC
+        - OAUTH2
+        - API_KEY
+        - MTLS
+        - JWT
+
+    HealthStatus:
+      type: string
+      enum:
+        - HEALTHY
+        - DEGRADED
+        - UNAVAILABLE
+        - UNKNOWN
+
+    HITLDecision:
+      type: string
+      enum:
+        - APPROVED
+        - REJECTED
+        - ESCALATED
+        - ACKNOWLEDGED
+        - DEFERRED
+
+    NodeStatus:
+      type: string
+      enum:
+        - PENDING
+        - RUNNING
+        - COMPLETED
+        - FAILED
+        - SKIPPED
+        - RETRYING
+
+    PolicyType:
+      type: string
+      enum:
+        - APPROVAL
+        - COMPLIANCE
+        - RISK
+        - ACCESS_CONTROL
+        - DATA_GOVERNANCE
+
+    ApprovalType:
+      type: string
+      enum:
+        - ANY
+        - ALL
+        - MAJORITY
+
+    VersionStatus:
+      type: string
+      enum:
+        - DRAFT
+        - ACTIVE
+        - DEPRECATED
+        - ARCHIVED
+
+    HttpMethod:
+      type: string
+      enum: [GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS]
+
+    # ── Supporting Objects ────────────────────────────────────────────────────
+
+    Agent:
+      type: object
+      required: [agentId, agentName]
+      properties:
+        agentId:
+          type: string
+          format: uuid
+        agentName:
+          type: string
+          maxLength: 255
+        agentType:
+          $ref: '#/components/schemas/AgentType'
+        agentVersion:
+          type: string
+          pattern: '^\d+\.\d+\.\d+$'
+          description: Semantic version of the agent.
+        description:
+          type: string
+          maxLength: 1024
+        capabilities:
+          type: array
+          items:
+            type: string
+
+    AgentRun:
+      type: object
+      required: [runId]
+      properties:
+        runId:
+          type: string
+          format: uuid
+        runStatus:
+          $ref: '#/components/schemas/NodeStatus'
+        startTime:
+          type: string
+          format: date-time
+        endTime:
+          type: string
+          format: date-time
+        tokenUsage:
+          type: object
+          properties:
+            inputTokens:
+              type: integer
+              minimum: 0
+            outputTokens:
+              type: integer
+              minimum: 0
+            totalTokens:
+              type: integer
+              minimum: 0
+            estimatedCostUsd:
+              type: number
+              format: double
+              minimum: 0
+
+    Skill:
+      type: object
+      required: [skillId, skillName]
+      properties:
+        skillId:
+          type: string
+          format: uuid
+        skillName:
+          type: string
+          maxLength: 255
+        skillVersion:
+          type: string
+        skillType:
+          type: string
+        description:
+          type: string
+        permittedTools:
+          type: array
+          items:
+            type: string
+          description: List of tool names this skill is permitted to invoke.
+
+    ToolCall:
+      type: object
+      required: [toolCallId, toolName]
+      properties:
+        toolCallId:
+          type: string
+          format: uuid
+        toolName:
+          type: string
+          maxLength: 255
+        toolInput:
+          type: object
+          description: Input arguments passed to the tool.
+          additionalProperties: true
+        toolOutput:
+          type: object
+          description: Output returned by the tool.
+          additionalProperties: true
+        executionTimeMs:
+          type: integer
+          minimum: 0
+          description: Tool execution duration in milliseconds.
+        status:
+          $ref: '#/components/schemas/NodeStatus'
+        errorMessage:
+          type: string
+
+    HumanTask:
+      type: object
+      required: [taskId, taskType, assignedTo]
+      properties:
+        taskId:
+          type: string
+          format: uuid
+        taskType:
+          type: string
+        assignedTo:
+          type: string
+          description: User or role assigned to the task.
+        description:
+          type: string
+          maxLength: 4096
+        dueDate:
+          type: string
+          format: date-time
+        priority:
+          type: string
+          enum: [LOW, MEDIUM, HIGH, CRITICAL]
+        instructions:
+          type: string
+          maxLength: 8192
+
+    HumanDecision:
+      type: object
+      required: [decisionId, decision, decidedBy, decidedAt]
+      properties:
+        decisionId:
+          type: string
+          format: uuid
+        decision:
+          $ref: '#/components/schemas/HITLDecision'
+        justification:
+          type: string
+          maxLength: 4096
+        decidedBy:
+          type: string
+          description: User identity (email or user ID) who made the decision.
+        decidedAt:
+          type: string
+          format: date-time
+        attachments:
+          type: array
+          items:
+            type: string
+            format: uri
+          description: Supporting document URIs.
+
+    Evidence:
+      type: object
+      required: [evidenceId, evidenceType]
+      properties:
+        evidenceId:
+          type: string
+          format: uuid
+        evidenceType:
+          type: string
+          maxLength: 128
+        evidenceData:
+          type: object
+          additionalProperties: true
+          description: Structured evidence payload.
+        source:
+          type: string
+          maxLength: 512
+        collectedAt:
+          type: string
+          format: date-time
+        hash:
+          type: string
+          description: SHA-256 hash of the evidence data for tamper detection.
+
+    # ── CloudEvent Base ───────────────────────────────────────────────────────
+    # Per https://github.com/cloudevents/spec/blob/main/cloudevents/spec.md
+    CloudEventBase:
+      type: object
+      required:
+        - id
+        - source
+        - specversion
+        - type
+      properties:
+        id:
+          type: string
+          description: |
+            [CloudEvent] Identifies the event. Producers MUST ensure that
+            `source` + `id` is unique for each distinct event.
+          example: A234-1234-1234
+        source:
+          type: string
+          format: uri-reference
+          description: |
+            [CloudEvent] Identifies the context in which an event happened.
+            Often a URI identifying the producer.
+          example: /finos/workflow/order-approval-v2
+        specversion:
+          type: string
+          enum: ["1.0"]
+          description: "[CloudEvent] The version of the CloudEvents specification. Must be \"1.0\"."
+          example: "1.0"
+        type:
+          type: string
+          description: |
+            [CloudEvent] Describes the type of event related to the originating occurrence.
+            Should be prefixed with a reverse-DNS name.
+          example: "{event-namespace}.finos.agent.llm-call"
+        datacontenttype:
+          type: string
+          description: "[CloudEvent] Content type of the data value. RFC 2046 media type."
+          example: application/json
+        dataschema:
+          type: string
+          format: uri
+          description: "[CloudEvent] Identifies the schema that data adheres to."
+        subject:
+          type: string
+          description: "[CloudEvent] Describes the subject of the event in the context of the event producer."
+          example: workflow-instance/3fa85f64-5717-4562-b3fc-2c963f66afa6
+        time:
+          type: string
+          format: date-time
+          description: "[CloudEvent] Timestamp of when the occurrence happened (RFC 3339)."
+        data:
+          description: "[CloudEvent] Domain-specific event payload."
+
+    # ── FinOSEvent Base (extends CloudEvent) ──────────────────────────────────
+    FinOSEventBase:
+      allOf:
+        - $ref: '#/components/schemas/CloudEventBase'
+        - type: object
+          required:
+            - finOSEventType
+            - workflowInstanceId
+            - tenantId
+          properties:
+            finOSEventType:
+              $ref: '#/components/schemas/FinOSEventType'
+              description: FinOS sub-type discriminator for event vertices.
+            workflowInstanceId:
+              type: string
+              format: uuid
+              description: The FinOSWorkflowExecutionHistory instanceId this event belongs to.
+            correlationId:
+              type: string
+              format: uuid
+              description: Correlation ID for distributed tracing across FinOS services.
+            tenantId:
+              type: string
+              description: Tenant identifier.
+            traceId:
+              type: string
+              description: OpenTelemetry trace ID (W3C TraceContext format).
+            spanId:
+              type: string
+              description: OpenTelemetry span ID.
+
+    # ── FinOSVertex Base ──────────────────────────────────────────────────────
+    FinOSVertexBase:
+      type: object
+      required:
+        - vertexId
+        - vertexType
+      properties:
+        vertexId:
+          type: string
+          format: uuid
+          description: Unique identifier for this vertex within the DAG.
+        vertexType:
+          $ref: '#/components/schemas/FinOSVertexType'
+        label:
+          type: string
+          maxLength: 512
+          description: Human-readable label for rendering in graph visualisations.
+        finOSEdgeIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: IDs of all edges incident to this vertex (outgoing by default).
+          readOnly: true
+        properties:
+          type: object
+          additionalProperties: true
+          description: Arbitrary key-value metadata attached to this vertex.
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+        updatedAt:
+          type: string
+          format: date-time
+          readOnly: true
+
+    # ── FinOSVertex (polymorphic) ─────────────────────────────────────────────
+    FinOSVertex:
+      description: |
+        Polymorphic vertex node in a FinOSWorkflowExecutionHistory DAG.
+        The `vertexType` field acts as the discriminator.
+      discriminator:
+        propertyName: vertexType
+        mapping:
+          WorkflowDefinition:  '#/components/schemas/WorkflowDefinitionVertex'
+          WorkflowVersion:     '#/components/schemas/WorkflowVersionVertex'
+          Execution:           '#/components/schemas/ExecutionVertex'
+          NodeInstance:        '#/components/schemas/NodeInstanceVertex'
+          EdgeEvaluation:      '#/components/schemas/EdgeEvaluationVertex'
+          FinOSAgentEvent:     '#/components/schemas/FinOSAgentEventVertex'
+          FinOSAPIEvent:       '#/components/schemas/FinOSAPIEventVertex'
+          FinOSHITLEvent:      '#/components/schemas/FinOSHITLEventVertex'
+          FinOSPolicyEvent:    '#/components/schemas/FinOSPolicyEventVertex'
+          FinOSPolicy:         '#/components/schemas/FinOSPolicyVertex'
+          ApprovalTier:        '#/components/schemas/ApprovalTierVertex'
+          Artifact:            '#/components/schemas/ArtifactVertex'
+          Dataset:             '#/components/schemas/DatasetVertex'
+          Exception:           '#/components/schemas/ExceptionVertex'
+          ExternalSystem:      '#/components/schemas/ExternalSystemVertex'
+      oneOf:
+        - $ref: '#/components/schemas/WorkflowDefinitionVertex'
+        - $ref: '#/components/schemas/WorkflowVersionVertex'
+        - $ref: '#/components/schemas/ExecutionVertex'
+        - $ref: '#/components/schemas/NodeInstanceVertex'
+        - $ref: '#/components/schemas/EdgeEvaluationVertex'
+        - $ref: '#/components/schemas/FinOSAgentEventVertex'
+        - $ref: '#/components/schemas/FinOSAPIEventVertex'
+        - $ref: '#/components/schemas/FinOSHITLEventVertex'
+        - $ref: '#/components/schemas/FinOSPolicyEventVertex'
+        - $ref: '#/components/schemas/FinOSPolicyVertex'
+        - $ref: '#/components/schemas/ApprovalTierVertex'
+        - $ref: '#/components/schemas/ArtifactVertex'
+        - $ref: '#/components/schemas/DatasetVertex'
+        - $ref: '#/components/schemas/ExceptionVertex'
+        - $ref: '#/components/schemas/ExternalSystemVertex'
+
+    # ── Concrete Vertex Schemas ───────────────────────────────────────────────
+
+    WorkflowDefinitionVertex:
+      allOf:
+        - $ref: '#/components/schemas/FinOSVertexBase'
+        - type: object
+          properties:
+            definitionId:
+              type: string
+              format: uuid
+            workflowName:
+              type: string
+              maxLength: 255
+            description:
+              type: string
+              maxLength: 4096
+            category:
+              type: string
+            owner:
+              type: string
+              description: Owning team or user identity.
+            tags:
+              type: array
+              items:
+                type: string
+
+    WorkflowVersionVertex:
+      allOf:
+        - $ref: '#/components/schemas/FinOSVertexBase'
+        - type: object
+          properties:
+            versionId:
+              type: string
+              format: uuid
+            versionNumber:
+              type: string
+              pattern: '^\d+\.\d+\.\d+$'
+              description: Semantic version string (e.g. "2.4.1").
+            changeLog:
+              type: string
+              maxLength: 8192
+            status:
+              $ref: '#/components/schemas/VersionStatus'
+            publishedAt:
+              type: string
+              format: date-time
+            publishedBy:
+              type: string
+
+    ExecutionVertex:
+      allOf:
+        - $ref: '#/components/schemas/FinOSVertexBase'
+        - type: object
+          properties:
+            executionId:
+              type: string
+              format: uuid
+            triggeredBy:
+              type: string
+            triggerType:
+              $ref: '#/components/schemas/TriggerType'
+            inputPayload:
+              type: object
+              additionalProperties: true
+            outputPayload:
+              type: object
+              additionalProperties: true
+            durationMs:
+              type: integer
+              minimum: 0
+              readOnly: true
+
+    NodeInstanceVertex:
+      allOf:
+        - $ref: '#/components/schemas/FinOSVertexBase'
+        - type: object
+          properties:
+            nodeId:
+              type: string
+              format: uuid
+            nodeName:
+              type: string
+              maxLength: 255
+            nodeType:
+              type: string
+            configuration:
+              type: object
+              additionalProperties: true
+            inputData:
+              type: object
+              additionalProperties: true
+            outputData:
+              type: object
+              additionalProperties: true
+            retryCount:
+              type: integer
+              minimum: 0
+              default: 0
+            maxRetries:
+              type: integer
+              minimum: 0
+            status:
+              $ref: '#/components/schemas/NodeStatus'
+            startedAt:
+              type: string
+              format: date-time
+            completedAt:
+              type: string
+              format: date-time
+
+    EdgeEvaluationVertex:
+      allOf:
+        - $ref: '#/components/schemas/FinOSVertexBase'
+        - type: object
+          properties:
+            evaluationId:
+              type: string
+              format: uuid
+            condition:
+              type: string
+              maxLength: 2048
+              description: The condition expression that was evaluated.
+            evaluationResult:
+              type: boolean
+            evaluatedAt:
+              type: string
+              format: date-time
+            evaluatedBy:
+              type: string
+            evaluationContext:
+              type: object
+              additionalProperties: true
+              description: Variables available at time of evaluation.
+
+    # ── FinOSEvent Vertices (all extend FinOSVertexBase + FinOSEventBase) ──────
+
+    FinOSAgentEventVertex:
+      allOf:
+        - $ref: '#/components/schemas/FinOSVertexBase'
+        - $ref: '#/components/schemas/FinOSEventBase'
+        - type: object
+          description: |
+            Vertex representing an AI agent action event. Extends both
+            `FinOSVertexBase` and `FinOSEventBase` (CloudEvent-compliant).
+          properties:
+            agent:
+              $ref: '#/components/schemas/Agent'
+            agentRun:
+              $ref: '#/components/schemas/AgentRun'
+            llmModelName:
+              type: string
+              maxLength: 255
+              description: Name of the LLM used (e.g. "claude-sonnet-4-6").
+              example: claude-sonnet-4-6
+            llmModelVersion:
+              type: string
+              description: Version string of the LLM.
+              example: "20250514"
+            promptTemplate:
+              type: string
+              description: The prompt template ID or content used for this invocation.
+            toolCalls:
+              type: array
+              items:
+                $ref: '#/components/schemas/ToolCall'
+              description: Tool calls made by the agent during execution.
+            skills:
+              type: array
+              items:
+                $ref: '#/components/schemas/Skill'
+              description: Skill(s) active during this agent event.
+            humanTask:
+              $ref: '#/components/schemas/HumanTask'
+              description: Human-in-the-loop task generated by this agent event, if any.
+            humanDecision:
+              $ref: '#/components/schemas/HumanDecision'
+              description: Human decision recorded against this event, if any.
+            evidence:
+              $ref: '#/components/schemas/Evidence'
+              description: Evidence artifact captured during this event.
+
+    FinOSAPIEventVertex:
+      allOf:
+        - $ref: '#/components/schemas/FinOSVertexBase'
+        - $ref: '#/components/schemas/FinOSEventBase'
+        - type: object
+          description: Vertex representing an external API call event.
+          properties:
+            endpoint:
+              type: string
+              format: uri
+              description: URI of the API endpoint called.
+            httpMethod:
+              $ref: '#/components/schemas/HttpMethod'
+            requestHeaders:
+              type: object
+              additionalProperties:
+                type: string
+              description: HTTP request headers (sensitive values redacted).
+            requestBody:
+              type: object
+              additionalProperties: true
+            responseStatusCode:
+              type: integer
+              minimum: 100
+              maximum: 599
+            responseHeaders:
+              type: object
+              additionalProperties:
+                type: string
+            responseBody:
+              type: object
+              additionalProperties: true
+            latencyMs:
+              type: integer
+              minimum: 0
+              description: API call round-trip latency in milliseconds.
+            apiVersion:
+              type: string
+            retryAttempt:
+              type: integer
+              minimum: 0
+              default: 0
+
+    FinOSHITLEventVertex:
+      allOf:
+        - $ref: '#/components/schemas/FinOSVertexBase'
+        - $ref: '#/components/schemas/FinOSEventBase'
+        - type: object
+          description: Vertex representing a Human-in-the-Loop (HITL) event.
+          properties:
+            assignedTo:
+              type: string
+              description: User identity or role to whom the task is assigned.
+            taskType:
+              type: string
+              enum:
+                - REVIEW
+                - APPROVE
+                - REJECT
+                - ESCALATE
+                - ACKNOWLEDGE
+                - OVERRIDE
+            taskDescription:
+              type: string
+              maxLength: 8192
+            dueDate:
+              type: string
+              format: date-time
+            completedAt:
+              type: string
+              format: date-time
+            decision:
+              $ref: '#/components/schemas/HITLDecision'
+            justification:
+              type: string
+              maxLength: 4096
+            attachments:
+              type: array
+              items:
+                type: string
+                format: uri
+              description: URIs of supporting documents.
+            escalationChain:
+              type: array
+              items:
+                type: string
+              description: Ordered list of roles/users in the escalation path.
+
+    FinOSPolicyEventVertex:
+      allOf:
+        - $ref: '#/components/schemas/FinOSVertexBase'
+        - $ref: '#/components/schemas/FinOSEventBase'
+        - type: object
+          description: Vertex representing a FinOS policy evaluation event.
+          required:
+            - finOSPolicyId
+            - finOSPolicyEvaluationOutcome
+          properties:
+            finOSPolicyId:
+              type: string
+              format: uuid
+              description: Identifier of the FinOSPolicy that was evaluated.
+            finOSPolicyEvaluationOutcome:
+              $ref: '#/components/schemas/FinOSPolicyEvaluationOutcome'
+              description: Result of the policy evaluation.
+            targetEscalationRole:
+              type: string
+              description: |
+                Role to escalate to if outcome is `Escalate` or `AttentionRequired`.
+            evaluationInputs:
+              type: object
+              additionalProperties: true
+              description: The input context fed to the policy evaluator.
+            evaluationOutputs:
+              type: object
+              additionalProperties: true
+              description: Raw output produced by the policy evaluator.
+            evaluatedAt:
+              type: string
+              format: date-time
+
+    FinOSPolicyVertex:
+      allOf:
+        - $ref: '#/components/schemas/FinOSVertexBase'
+        - type: object
+          properties:
+            policyId:
+              type: string
+              format: uuid
+            policyName:
+              type: string
+              maxLength: 255
+            policyVersion:
+              type: string
+            policyType:
+              $ref: '#/components/schemas/PolicyType'
+            rules:
+              type: array
+              items:
+                type: object
+                properties:
+                  ruleId:
+                    type: string
+                  ruleExpression:
+                    type: string
+                  ruleDescription:
+                    type: string
+            effectiveDate:
+              type: string
+              format: date
+            expirationDate:
+              type: string
+              format: date
+            owner:
+              type: string
+
+    ApprovalTierVertex:
+      allOf:
+        - $ref: '#/components/schemas/FinOSVertexBase'
+        - type: object
+          properties:
+            tierId:
+              type: string
+              format: uuid
+            tierName:
+              type: string
+              maxLength: 255
+            tierLevel:
+              type: integer
+              minimum: 1
+              description: Numeric level in the approval hierarchy (1 = first tier).
+            requiredApprovers:
+              type: integer
+              minimum: 1
+            approvers:
+              type: array
+              items:
+                type: string
+              description: User identities or roles that may approve at this tier.
+            approvalType:
+              $ref: '#/components/schemas/ApprovalType'
+            timeoutHours:
+              type: integer
+              minimum: 0
+              description: Time before automatic escalation (0 = no timeout).
+            escalationTierId:
+              type: string
+              format: uuid
+              description: ID of the next ApprovalTierVertex to escalate to on timeout.
+
+    ArtifactVertex:
+      allOf:
+        - $ref: '#/components/schemas/FinOSVertexBase'
+        - type: object
+          properties:
+            artifactId:
+              type: string
+              format: uuid
+            artifactType:
+              $ref: '#/components/schemas/ArtifactType'
+            artifactName:
+              type: string
+              maxLength: 512
+            storageLocation:
+              type: string
+              format: uri
+              description: URI pointing to the artifact storage location.
+            contentType:
+              type: string
+              description: MIME type (RFC 2046).
+            checksum:
+              type: string
+              description: SHA-256 checksum of the artifact content.
+            sizeBytes:
+              type: integer
+              minimum: 0
+            generatedAt:
+              type: string
+              format: date-time
+            generatedBy:
+              type: string
+              description: Agent or service that generated the artifact.
+
+    DatasetVertex:
+      allOf:
+        - $ref: '#/components/schemas/FinOSVertexBase'
+        - type: object
+          properties:
+            datasetId:
+              type: string
+              format: uuid
+            datasetName:
+              type: string
+              maxLength: 512
+            schema:
+              type: object
+              additionalProperties: true
+              description: JSON Schema describing the dataset structure.
+            source:
+              type: string
+              maxLength: 1024
+            recordCount:
+              type: integer
+              minimum: 0
+            dataClassification:
+              $ref: '#/components/schemas/DataClassification'
+            lineage:
+              type: object
+              additionalProperties: true
+              description: Data lineage metadata.
+            snapshotAt:
+              type: string
+              format: date-time
+
+    ExceptionVertex:
+      allOf:
+        - $ref: '#/components/schemas/FinOSVertexBase'
+        - type: object
+          properties:
+            exceptionId:
+              type: string
+              format: uuid
+            exceptionType:
+              type: string
+              maxLength: 255
+              description: Exception class or error code.
+            message:
+              type: string
+              maxLength: 4096
+            stackTrace:
+              type: string
+              description: Full stack trace if available.
+            severity:
+              type: string
+              enum: [LOW, MEDIUM, HIGH, CRITICAL]
+            occurredAt:
+              type: string
+              format: date-time
+            resolvedAt:
+              type: string
+              format: date-time
+            resolvedBy:
+              type: string
+            resolution:
+              type: string
+              maxLength: 4096
+            relatedVertexIds:
+              type: array
+              items:
+                type: string
+                format: uuid
+              description: IDs of vertices related to this exception.
+
+    ExternalSystemVertex:
+      allOf:
+        - $ref: '#/components/schemas/FinOSVertexBase'
+        - type: object
+          properties:
+            systemId:
+              type: string
+              format: uuid
+            systemName:
+              type: string
+              maxLength: 255
+            systemType:
+              $ref: '#/components/schemas/ExternalSystemType'
+            endpoint:
+              type: string
+              format: uri
+            protocol:
+              type: string
+              maxLength: 64
+              description: Transport protocol (e.g. HTTPS, AMQP, gRPC).
+            authType:
+              $ref: '#/components/schemas/AuthType'
+            healthStatus:
+              $ref: '#/components/schemas/HealthStatus'
+            region:
+              type: string
+            owner:
+              type: string
+
+    # ── FinOSEdge ──────────────────────────────────────────────────────────────
+    FinOSEdge:
+      type: object
+      required:
+        - edgeId
+        - edgeType
+        - sourceVertexId
+        - targetVertexId
+      properties:
+        edgeId:
+          type: string
+          format: uuid
+          description: Unique identifier for this edge within the DAG.
+        edgeType:
+          $ref: '#/components/schemas/FinOSEdgeType'
+          description: Semantic type of the directed relation.
+        sourceVertexId:
+          type: string
+          format: uuid
+          description: ID of the tail (origin) vertex.
+        targetVertexId:
+          type: string
+          format: uuid
+          description: ID of the head (destination) vertex.
+        finOSVertexIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+          minItems: 2
+          maxItems: 2
+          description: |
+            Ordered pair `[sourceVertexId, targetVertexId]`. Provided for
+            convenience; must be consistent with the individual source/target fields.
+          readOnly: true
+        label:
+          type: string
+          maxLength: 255
+          description: Human-readable label for this edge.
+        weight:
+          type: number
+          format: double
+          description: Optional numeric weight for graph algorithms.
+        metadata:
+          type: object
+          additionalProperties: true
+          description: Arbitrary key-value metadata attached to this edge.
+        timestamp:
+          type: string
+          format: date-time
+          description: Time at which this edge relation was established.
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+        updatedAt:
+          type: string
+          format: date-time
+          readOnly: true
+
+    # ── FinOSWorkflowExecutionHistory ─────────────────────────────────────────
+    FinOSWorkflowExecutionHistory:
+      type: object
+      required:
+        - instanceId
+        - executionStatus
+        - executionStartTime
+      properties:
+        instanceId:
+          type: string
+          format: uuid
+          description: Globally unique identifier for this execution history instance.
+          readOnly: true
+        executionStatus:
+          $ref: '#/components/schemas/ExecutionStatus'
+        executionStartTime:
+          type: string
+          format: date-time
+          description: UTC timestamp when execution began.
+        executionEndTime:
+          type: [string, "null"]
+          format: date-time
+          description: |
+            UTC timestamp when execution finished. Null if still RUNNING or PENDING.
+        finOSVertices:
+          type: array
+          items:
+            $ref: '#/components/schemas/FinOSVertex'
+          description: All vertex nodes in the DAG.
+        finOSEdges:
+          type: array
+          items:
+            $ref: '#/components/schemas/FinOSEdge'
+          description: All directed edges in the DAG.
+        vertexCount:
+          type: integer
+          minimum: 0
+          readOnly: true
+        edgeCount:
+          type: integer
+          minimum: 0
+          readOnly: true
+        tenantId:
+          type: string
+          description: Tenant identifier.
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+        updatedAt:
+          type: string
+          format: date-time
+          readOnly: true
+        createdBy:
+          type: string
+          readOnly: true
+        updatedBy:
+          type: string
+          readOnly: true
+
+    FinOSWorkflowExecutionHistoryCreate:
+      type: object
+      required:
+        - executionStartTime
+      properties:
+        instanceId:
+          type: string
+          format: uuid
+          description: |
+            Client-provided ID. If omitted, the server generates a UUID v4.
+        executionStatus:
+          $ref: '#/components/schemas/ExecutionStatus'
+          default: PENDING
+        executionStartTime:
+          type: string
+          format: date-time
+        executionEndTime:
+          type: [string, "null"]
+          format: date-time
+        finOSVertices:
+          type: array
+          items:
+            $ref: '#/components/schemas/FinOSVertex'
+          default: []
+        finOSEdges:
+          type: array
+          items:
+            $ref: '#/components/schemas/FinOSEdge'
+          default: []
+        tenantId:
+          type: string
+
+    # ── Response Envelopes ────────────────────────────────────────────────────
+
+    ResponseMeta:
+      type: object
+      properties:
+        requestId:
+          type: string
+          format: uuid
+          description: Unique ID for this API request (for support & tracing).
+        timestamp:
+          type: string
+          format: date-time
+        apiVersion:
+          type: string
+          example: "1.0"
+
+    PaginationMeta:
+      type: object
+      description: Pagination metadata using the FinOS zero-based offset pattern.
+      properties:
+        pageSize:
+          type: integer
+        pageStartIndex:
+          type: integer
+        totalCount:
+          type: integer
+        hasNext:
+          type: boolean
+        hasPrev:
+          type: boolean
+
+    ExecutionHistorySingleResponse:
+      type: object
+      properties:
+        data:
+          $ref: '#/components/schemas/FinOSWorkflowExecutionHistory'
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
+
+    ExecutionHistoryListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/FinOSWorkflowExecutionHistory'
+        meta:
+          allOf:
+            - $ref: '#/components/schemas/ResponseMeta'
+            - type: object
+              properties:
+                pagination:
+                  $ref: '#/components/schemas/PaginationMeta'
+
+    VertexSingleResponse:
+      type: object
+      properties:
+        data:
+          $ref: '#/components/schemas/FinOSVertex'
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
+
+    VertexListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/FinOSVertex'
+        meta:
+          allOf:
+            - $ref: '#/components/schemas/ResponseMeta'
+            - type: object
+              properties:
+                pagination:
+                  $ref: '#/components/schemas/PaginationMeta'
+
+    EdgeSingleResponse:
+      type: object
+      properties:
+        data:
+          $ref: '#/components/schemas/FinOSEdge'
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
+
+    EdgeListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/FinOSEdge'
+        meta:
+          allOf:
+            - $ref: '#/components/schemas/ResponseMeta'
+            - type: object
+              properties:
+                pagination:
+                  $ref: '#/components/schemas/PaginationMeta'
+
+    # ── Graph Payloads ────────────────────────────────────────────────────────
+
+    GraphResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            instanceId:
+              type: string
+              format: uuid
+            format:
+              type: string
+              enum: [adjacency, edgelist, cytoscape]
+            adjacency:
+              type: object
+              additionalProperties:
+                type: object
+                properties:
+                  vertex:
+                    $ref: '#/components/schemas/FinOSVertex'
+                  outgoingEdges:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/FinOSEdge'
+            elements:
+              description: Cytoscape.js elements format (when format=cytoscape).
+              type: object
+              properties:
+                nodes:
+                  type: array
+                  items:
+                    type: object
+                edges:
+                  type: array
+                  items:
+                    type: object
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
+
+    TraverseRequest:
+      type: object
+      required:
+        - startVertexId
+      properties:
+        startVertexId:
+          type: string
+          format: uuid
+          description: Vertex ID from which traversal begins.
+        algorithm:
+          type: string
+          enum: [BFS, DFS]
+          default: BFS
+          description: Traversal algorithm — breadth-first or depth-first.
+        maxDepth:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 10
+          description: Maximum traversal depth from the starting vertex.
+        direction:
+          type: string
+          enum: [outgoing, incoming, both]
+          default: outgoing
+        edgeTypeFilter:
+          type: array
+          items:
+            $ref: '#/components/schemas/FinOSEdgeType'
+          description: Restrict traversal to edges of these types only.
+        vertexTypeFilter:
+          type: array
+          items:
+            $ref: '#/components/schemas/FinOSVertexType'
+          description: Restrict traversal to vertices of these types only.
+
+    TraverseResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            startVertexId:
+              type: string
+              format: uuid
+            algorithm:
+              type: string
+            visitOrder:
+              type: array
+              items:
+                type: object
+                properties:
+                  depth:
+                    type: integer
+                  vertex:
+                    $ref: '#/components/schemas/FinOSVertex'
+                  traversedViaEdge:
+                    $ref: '#/components/schemas/FinOSEdge'
+            visitedVertexCount:
+              type: integer
+            visitedEdgeCount:
+              type: integer
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
+
+    PathResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            sourceVertexId:
+              type: string
+              format: uuid
+            targetVertexId:
+              type: string
+              format: uuid
+            pathLength:
+              type: integer
+              description: Number of edges in the path.
+            vertices:
+              type: array
+              items:
+                $ref: '#/components/schemas/FinOSVertex'
+            edges:
+              type: array
+              items:
+                $ref: '#/components/schemas/FinOSEdge'
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
+
+    # ── Problem Details (RFC 7807) ────────────────────────────────────────────
+    Problem:
+      type: object
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          format: uri
+          description: URI identifying the problem type.
+          example: "https://{api-host}/finos/errors/not-found"
+        title:
+          type: string
+          description: Short, human-readable summary.
+          example: Resource Not Found
+        status:
+          type: integer
+          description: HTTP status code.
+          example: 404
+        detail:
+          type: string
+          description: Human-readable explanation specific to this occurrence.
+          example: FinOSWorkflowExecutionHistory with instanceId 'xxx' was not found.
+        instance:
+          type: string
+          format: uri-reference
+          description: URI reference identifying the specific occurrence.
+        traceId:
+          type: string
+          description: Distributed trace ID for support escalation.
+        timestamp:
+          type: string
+          format: date-time
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field:
+                type: string
+              code:
+                type: string
+              message:
+                type: string
+          description: Field-level validation errors (for 400/422 responses).
+
+  # ── Examples ───────────────────────────────────────────────────────────────
+  examples:
+
+    MinimalCreateRequest:
+      summary: Minimal creation — no vertices or edges yet
+      value:
+        executionStartTime: "2026-05-18T09:00:00Z"
+        executionStatus: PENDING
+        tenantId: "tenant-acme-prod"
+
+    CreateWithGraphRequest:
+      summary: Create with an initial two-vertex, one-edge DAG
+      value:
+        executionStartTime: "2026-05-18T09:00:00Z"
+        executionStatus: RUNNING
+        tenantId: "tenant-acme-prod"
+        finOSVertices:
+          - vertexId: "a1b2c3d4-0000-0000-0000-000000000001"
+            vertexType: WorkflowDefinition
+            label: "Invoice Approval Workflow"
+            workflowName: "Invoice Approval"
+            owner: "finance-ops"
+          - vertexId: "a1b2c3d4-0000-0000-0000-000000000002"
+            vertexType: FinOSAgentEvent
+            label: "LLM Invoice Classification"
+            id: "evt-001"
+            source: "{source-root}/finos/agent/invoice-classifier"
+            specversion: "1.0"
+            type: "{event-namespace}.finos.agent.classify"
+            time: "2026-05-18T09:00:05Z"
+            finOSEventType: FinOSAgentEvent
+            workflowInstanceId: "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+            tenantId: "tenant-acme-prod"
+            llmModelName: "claude-sonnet-4-6"
+            llmModelVersion: "20250514"
+        finOSEdges:
+          - edgeId: "e1000000-0000-0000-0000-000000000001"
+            edgeType: EXECUTES
+            sourceVertexId: "a1b2c3d4-0000-0000-0000-000000000001"
+            targetVertexId: "a1b2c3d4-0000-0000-0000-000000000002"
+            label: "triggers LLM classification"
+
+  # ── Security ───────────────────────────────────────────────────────────────
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT issued by the platform identity provider (OAuth 2.0 / OIDC).
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-FinOS-API-Key
+      description: Service-to-service API key for machine clients.
+
+security:
+  - BearerAuth: []
+  - ApiKeyAuth: []
